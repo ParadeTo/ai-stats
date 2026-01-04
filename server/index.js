@@ -1,3 +1,6 @@
+// 加载环境变量
+require('dotenv').config();
+
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const bodyParser = require('body-parser');
@@ -7,6 +10,8 @@ const path = require('path');
 const parseDiff = require('parse-diff');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
+const GitHubApi = require('./lib/githubApi');
+const { buildAiLinesSet, buildAiDeletesSet, analyzeCommitRangeDiff, analyzeFileAttribution, hashLine } = require('./lib/codeAttribution');
 
 const app = express();
 const port = 3001;
@@ -141,14 +146,6 @@ app.get('/api/stats', (req, res) => {
         });
     });
 });
-
-// Helper: Hash a single line of code
-function hashLine(line) {
-    return crypto.createHash('sha256')
-        .update(line.trim())
-        .digest('hex')
-        .substring(0, 16);
-}
 
 // GET /api/commits - Get commit list for a repository
 app.get('/api/commits', (req, res) => {
@@ -788,9 +785,413 @@ app.get('/api/analyze-file', (req, res) => {
     });
 });
 
-app.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
+// ==================== GitHub API 集成 ====================
+
+// GET /api/github/commits - 获取 GitHub 仓库的 commits 列表
+app.get('/api/github/commits', async (req, res) => {
+    const { repo_url, branch = 'main', per_page = 30, page = 1, github_token } = req.query;
+
+    if (!repo_url) {
+        return res.status(400).json({ error: 'Missing repo_url' });
+    }
+
+    try {
+        // 优先使用查询参数中的 token，否则使用环境变量
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        const commits = await github.getCommits(repo_url, branch, parseInt(per_page), parseInt(page));
+        
+        const formattedCommits = commits.map(commit => ({
+            sha: commit.sha,
+            message: commit.commit.message.split('\n')[0], // 只取第一行
+            author: commit.commit.author.name,
+            date: commit.commit.author.date,
+            url: commit.html_url
+        }));
+
+        res.json({
+            commits: formattedCommits,
+            total: formattedCommits.length,
+            page: parseInt(page),
+            per_page: parseInt(per_page)
+        });
+    } catch (error) {
+        console.error('[github/commits] Error:', error.message);
+        res.status(500).json({ error: `Failed to get commits: ${error.message}` });
+    }
 });
 
-module.exports = { app, db };
+// GET /api/github/commit-diff - 获取 GitHub commit 的 diff
+app.get('/api/github/commit-diff', async (req, res) => {
+    const { repo_url, sha, github_token } = req.query;
+
+    if (!repo_url || !sha) {
+        return res.status(400).json({ error: 'Missing repo_url or sha' });
+    }
+
+    try {
+        // 优先使用查询参数中的 token，否则使用环境变量
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        const diff = await github.getCommitDiff(repo_url, sha);
+        
+        res.setHeader('Content-Type', 'text/plain');
+        res.send(diff);
+    } catch (error) {
+        console.error('[github/commit-diff] Error:', error.message);
+        res.status(500).json({ error: `Failed to get commit diff: ${error.message}` });
+    }
+});
+
+// GET /api/github/compare-diff - 获取两个 commit 之间的 diff
+app.get('/api/github/compare-diff', async (req, res) => {
+    const { repo_url, base, head, github_token } = req.query;
+
+    if (!repo_url || !base || !head) {
+        return res.status(400).json({ error: 'Missing repo_url, base, or head' });
+    }
+
+    try {
+        // 优先使用查询参数中的 token，否则使用环境变量
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        const diff = await github.getCompareDiff(repo_url, base, head);
+        
+        res.setHeader('Content-Type', 'text/plain');
+        res.send(diff);
+    } catch (error) {
+        console.error('[github/compare-diff] Error:', error.message);
+        res.status(500).json({ error: `Failed to get compare diff: ${error.message}` });
+    }
+});
+
+// GET /api/github/pr-diff - 获取 Pull Request 的 diff
+app.get('/api/github/pr-diff', async (req, res) => {
+    const { repo_url, pull_number, github_token } = req.query;
+
+    if (!repo_url || !pull_number) {
+        return res.status(400).json({ error: 'Missing repo_url or pull_number' });
+    }
+
+    try {
+        // 优先使用查询参数中的 token，否则使用环境变量
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        const diff = await github.getPullRequestDiff(repo_url, parseInt(pull_number));
+        
+        res.setHeader('Content-Type', 'text/plain');
+        res.send(diff);
+    } catch (error) {
+        console.error('[github/pr-diff] Error:', error.message);
+        res.status(500).json({ error: `Failed to get PR diff: ${error.message}` });
+    }
+});
+
+// GET /api/github/analyze-commit-range - 分析 GitHub commit 范围的 AI 代码占比
+app.get('/api/github/analyze-commit-range', async (req, res) => {
+    const { repo_url, base, head, github_token } = req.query;
+
+    if (!repo_url || !base || !head) {
+        return res.status(400).json({ error: 'Missing repo_url, base, or head' });
+    }
+
+    try {
+        // 1. 从 GitHub 获取 diff
+        // 优先使用查询参数中的 token，否则使用环境变量
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        const diff = await github.getCompareDiff(repo_url, base, head);
+        
+        // 2. 解析 diff
+        const files = parseDiff(diff);
+        if (files.length === 0) {
+            return res.json({
+                repo_url,
+                from_commit: base,
+                to_commit: head,
+                files: [],
+                summary: { ai_lines: 0, total_added: 0, total_deleted: 0, ai_ratio: 0 }
+            });
+        }
+
+        // 3. 从数据库获取 AI 代码知识库
+        const repoName = path.basename(repo_url.replace('.git', ''));
+        db.all('SELECT * FROM task_records WHERE repo_url LIKE ?', [`%${repoName}%`], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            // 4. 构建 AI 代码知识库
+            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
+
+            // 5. 分析每个文件的变更
+            const fileStats = [];
+            let totalAiAdded = 0;
+            let totalAdded = 0;
+            let totalDeleted = 0;
+
+            files.forEach(file => {
+                const { changes, stats } = analyzeCommitRangeDiff(file, allAiLines);
+                
+                fileStats.push({
+                    file_path: file.to || file.from,
+                    ai_lines: stats.ai_added,
+                    added_lines: stats.added,
+                    deleted_lines: stats.deleted,
+                    ai_ratio: stats.added > 0 ? (stats.ai_added / stats.added * 100) : 0
+                });
+
+                totalAiAdded += stats.ai_added;
+                totalAdded += stats.added;
+                totalDeleted += stats.deleted;
+            });
+
+            res.json({
+                repo_url,
+                from_commit: base,
+                to_commit: head,
+                files: fileStats,
+                summary: {
+                    ai_lines: totalAiAdded,
+                    total_added: totalAdded,
+                    total_deleted: totalDeleted,
+                    ai_ratio: totalAdded > 0 ? (totalAiAdded / totalAdded * 100) : 0
+                }
+            });
+        });
+    } catch (error) {
+        console.error('[github/analyze-commit-range] Error:', error.message);
+        res.status(500).json({ error: `Failed to analyze commit range: ${error.message}` });
+    }
+});
+
+// GET /api/github/commit-range-file-diff - 获取 GitHub commit 范围内特定文件的 diff
+app.get('/api/github/commit-range-file-diff', async (req, res) => {
+    const { repo_url, file_path, from_commit, to_commit, github_token } = req.query;
+
+    if (!repo_url || !file_path || !from_commit) {
+        return res.status(400).json({ error: 'Missing repo_url, file_path, or from_commit' });
+    }
+
+    try {
+        // 1. 从 GitHub 获取 commit range 的完整 diff
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        const head = to_commit || 'HEAD';
+        const diff = await github.getCompareDiff(repo_url, from_commit, head);
+        
+        // 2. 解析 diff，找到目标文件
+        const files = parseDiff(diff);
+        const normalizePath = (path) => path ? path.replace(/^[ab]\//, '') : '';
+        const targetFile = files.find(file => {
+            const fileTo = normalizePath(file.to);
+            const fileFrom = normalizePath(file.from);
+            const normalizedFilePath = file_path.replace(/^[ab]\//, '');
+            return (fileTo === normalizedFilePath || fileFrom === normalizedFilePath || 
+                    fileTo.endsWith('/' + normalizedFilePath) || fileFrom.endsWith('/' + normalizedFilePath));
+        });
+
+        if (!targetFile) {
+            return res.json({
+                file_path,
+                from_commit,
+                to_commit: head,
+                changes: [],
+                stats: { added: 0, deleted: 0, ai_added: 0, ai_deleted: 0 }
+            });
+        }
+
+        // 3. 从数据库获取 AI 代码知识库
+        const repoName = path.basename(repo_url.replace('.git', ''));
+        db.all('SELECT * FROM task_records WHERE repo_url LIKE ?', [`%${repoName}%`], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            // 4. 构建 AI 代码知识库（包括添加和删除）
+            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesSet(rows, zlib, parseDiff);
+
+            // 5. 分析文件 diff（传入 allAiDeletes 以支持识别 AI 删除操作）
+            const { changes, stats } = analyzeCommitRangeDiff(targetFile, allAiLines, allAiDeletes);
+
+            res.json({
+                file_path: targetFile.to || targetFile.from || file_path,
+                from_commit,
+                to_commit: head,
+                changes,
+                stats
+            });
+        });
+    } catch (error) {
+        console.error('[github/commit-range-file-diff] Error:', error.message);
+        res.status(500).json({ error: `Failed to get file diff: ${error.message}` });
+    }
+});
+
+// GET /api/github/analyze-file - 分析 GitHub 文件的 AI 代码归属
+app.get('/api/github/analyze-file', async (req, res) => {
+    const { repo_url, file_path, branch = 'main', github_token } = req.query;
+
+    if (!repo_url || !file_path) {
+        return res.status(400).json({ error: 'Missing repo_url or file_path' });
+    }
+
+    try {
+        // 1. 从 GitHub 获取文件内容
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        const fileContent = await github.getFileContent(repo_url, file_path, branch);
+        const lines = fileContent.split('\n');
+
+        // 2. 从数据库获取 AI 代码知识库
+        const repoName = path.basename(repo_url.replace('.git', ''));
+        db.all('SELECT * FROM task_records WHERE repo_url LIKE ?', [`%${repoName}%`], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            // 3. 构建 AI 代码知识库
+            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
+
+            // 4. 分析文件归属
+            const { analysis, stats } = analyzeFileAttribution(lines, allAiLines);
+
+            res.json({
+                file_path,
+                stats,
+                analysis
+            });
+        });
+    } catch (error) {
+        console.error('[github/analyze-file] Error:', error.message);
+        res.status(500).json({ error: `Failed to analyze file: ${error.message}` });
+    }
+});
+
+// GET /api/github/analyze-pr - 分析 Pull Request 的 AI 代码占比
+app.get('/api/github/analyze-pr', async (req, res) => {
+    const { repo_url, pull_number, github_token } = req.query;
+
+    if (!repo_url || !pull_number) {
+        return res.status(400).json({ error: 'Missing repo_url or pull_number' });
+    }
+
+    try {
+        // 1. 从 GitHub 获取 PR diff
+        // 优先使用查询参数中的 token，否则使用环境变量
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        const diff = await github.getPullRequestDiff(repo_url, parseInt(pull_number));
+        
+        // 2. 解析 diff
+        const files = parseDiff(diff);
+        if (files.length === 0) {
+            return res.json({
+                repo_url,
+                pull_number: parseInt(pull_number),
+                files: [],
+                summary: { ai_lines: 0, total_added: 0, total_deleted: 0, ai_ratio: 0 }
+            });
+        }
+
+        // 3. 从数据库获取 AI 代码知识库
+        const repoName = path.basename(repo_url.replace('.git', ''));
+        db.all('SELECT * FROM task_records WHERE repo_url LIKE ?', [`%${repoName}%`], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ error: 'Database error' });
+            }
+
+            // 4. 构建 AI 代码知识库
+            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
+
+            // 5. 分析每个文件的变更
+            const fileStats = [];
+            let totalAiAdded = 0;
+            let totalAdded = 0;
+            let totalDeleted = 0;
+
+            files.forEach(file => {
+                const { changes, stats } = analyzeCommitRangeDiff(file, allAiLines);
+                
+                fileStats.push({
+                    file_path: file.to || file.from,
+                    ai_lines: stats.ai_added,
+                    added_lines: stats.added,
+                    deleted_lines: stats.deleted,
+                    ai_ratio: stats.added > 0 ? (stats.ai_added / stats.added * 100) : 0
+                });
+
+                totalAiAdded += stats.ai_added;
+                totalAdded += stats.added;
+                totalDeleted += stats.deleted;
+            });
+
+            res.json({
+                repo_url,
+                pull_number: parseInt(pull_number),
+                files: fileStats,
+                summary: {
+                    ai_lines: totalAiAdded,
+                    total_added: totalAdded,
+                    total_deleted: totalDeleted,
+                    ai_ratio: totalAdded > 0 ? (totalAiAdded / totalAdded * 100) : 0
+                }
+            });
+        });
+    } catch (error) {
+        console.error('[github/analyze-pr] Error:', error.message);
+        res.status(500).json({ error: `Failed to analyze PR: ${error.message}` });
+    }
+});
+
+const server = app.listen(port, () => {
+    console.log(`Server running at http://localhost:${port}`);
+    console.log('Press Ctrl+C to stop the server');
+    console.log('');
+});
+
+// 处理未捕获的异常，防止进程意外退出
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    // 不要立即退出，让服务器继续运行
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    // 不要立即退出，让服务器继续运行
+});
+
+// 优雅关闭
+process.on('SIGTERM', () => {
+    console.log('SIGTERM signal received: closing HTTP server');
+    server.close(() => {
+        console.log('HTTP server closed');
+        db.close((err) => {
+            if (err) {
+                console.error('Error closing database:', err);
+            } else {
+                console.log('Database closed');
+            }
+            process.exit(0);
+        });
+    });
+});
+
+process.on('SIGINT', () => {
+    console.log('\nSIGINT signal received: closing HTTP server');
+    server.close(() => {
+        console.log('HTTP server closed');
+        db.close((err) => {
+            if (err) {
+                console.error('Error closing database:', err);
+            } else {
+                console.log('Database closed');
+            }
+            process.exit(0);
+        });
+    });
+});
+
+module.exports = { app, db, server };
 

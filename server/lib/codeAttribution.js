@@ -12,14 +12,14 @@ function hashLine(line) {
 }
 
 /**
- * 从 AI 生成记录中提取所有 AI 生成的行的哈希集合
+ * 从 AI 生成记录中提取所有 AI 生成的行的哈希映射
  * @param {Array} rows - 数据库中的 task_records
  * @param {Object} zlib - zlib 模块
  * @param {Function} parseDiff - parse-diff 函数
- * @returns {Set} - AI 生成行的哈希集合
+ * @returns {Map} - AI 生成行的哈希映射，key=hash, value={timestamp, generation_id}
  */
-function buildAiLinesSet(rows, zlib, parseDiff) {
-    const aiLinesSet = new Set();
+function buildAiLinesMap(rows, zlib, parseDiff) {
+    const aiLinesMap = new Map();
     
     rows.forEach(row => {
         try {
@@ -31,8 +31,16 @@ function buildAiLinesSet(rows, zlib, parseDiff) {
                 file.chunks.forEach(chunk => {
                     chunk.changes.forEach(change => {
                         if (change.type === 'add') {
-                            const content = change.content.substring(1); // 移除 + 前缀
-                            aiLinesSet.add(hashLine(content));
+                            const content = change.content.substring(1);
+                            const hash = hashLine(content);
+                            
+                            // 只保存最早的 AI 生成记录
+                            if (!aiLinesMap.has(hash)) {
+                                aiLinesMap.set(hash, {
+                                    timestamp: row.created_at,
+                                    generation_id: row.generation_id
+                                });
+                            }
                         }
                     });
                 });
@@ -42,7 +50,73 @@ function buildAiLinesSet(rows, zlib, parseDiff) {
         }
     });
     
-    return aiLinesSet;
+    return aiLinesMap;
+}
+
+/**
+ * 从 AI 生成记录中提取所有 AI 删除的行的哈希映射
+ * @param {Array} rows - 数据库中的 task_records
+ * @param {Object} zlib - zlib 模块
+ * @param {Function} parseDiff - parse-diff 函数
+ * @returns {Map} - AI 删除行的哈希映射，key=hash, value={timestamp, generation_id}
+ */
+function buildAiDeletesMap(rows, zlib, parseDiff) {
+    const aiDeletesMap = new Map();
+    
+    rows.forEach(row => {
+        try {
+            const buffer = Buffer.from(row.compressed_diff, 'base64');
+            const decompressed = zlib.gunzipSync(buffer).toString('utf8');
+            const files = parseDiff(decompressed);
+            
+            files.forEach(file => {
+                file.chunks.forEach(chunk => {
+                    chunk.changes.forEach(change => {
+                        if (change.type === 'del') {
+                            const content = change.content.substring(1);
+                            const hash = hashLine(content);
+                            
+                            // 只保存最早的 AI 删除记录
+                            if (!aiDeletesMap.has(hash)) {
+                                aiDeletesMap.set(hash, {
+                                    timestamp: row.created_at,
+                                    generation_id: row.generation_id
+                                });
+                            }
+                        }
+                    });
+                });
+            });
+        } catch (e) {
+            // 忽略解析错误的记录
+        }
+    });
+    
+    return aiDeletesMap;
+}
+
+/**
+ * 向后兼容：从 Map 构建 Set（供不需要时间信息的场景使用）
+ * @param {Array} rows - 数据库中的 task_records
+ * @param {Object} zlib - zlib 模块
+ * @param {Function} parseDiff - parse-diff 函数
+ * @returns {Set} - AI 生成行的哈希集合
+ */
+function buildAiLinesSet(rows, zlib, parseDiff) {
+    const aiLinesMap = buildAiLinesMap(rows, zlib, parseDiff);
+    return new Set(aiLinesMap.keys());
+}
+
+/**
+ * 向后兼容：从 Map 构建 Set（供不需要时间信息的场景使用）
+ * @param {Array} rows - 数据库中的 task_records
+ * @param {Object} zlib - zlib 模块
+ * @param {Function} parseDiff - parse-diff 函数
+ * @returns {Set} - AI 删除行的哈希集合
+ */
+function buildAiDeletesSet(rows, zlib, parseDiff) {
+    const aiDeletesMap = buildAiDeletesMap(rows, zlib, parseDiff);
+    return new Set(aiDeletesMap.keys());
 }
 
 /**
@@ -50,9 +124,10 @@ function buildAiLinesSet(rows, zlib, parseDiff) {
  * 区分：在当前 range 内 AI 添加的行 vs 在 range 外添加的行
  * @param {Object} diffFile - parse-diff 解析的文件对象
  * @param {Set} allAiLines - 所有历史 AI 生成行的哈希
+ * @param {Set} allAiDeletes - 所有历史 AI 删除行的哈希（可选）
  * @returns {Object} - 包含变更列表和统计信息
  */
-function analyzeCommitRangeDiff(diffFile, allAiLines) {
+function analyzeCommitRangeDiff(diffFile, allAiLines, allAiDeletes = null) {
     const aiLinesInRange = new Set(); // 当前 range 内 AI 添加的行
     const changes = [];
     const stats = { added: 0, deleted: 0, ai_added: 0, ai_deleted: 0 };
@@ -89,8 +164,18 @@ function analyzeCommitRangeDiff(diffFile, allAiLines) {
                 });
             } else if (change.type === 'del') {
                 stats.deleted++;
-                // 删除的行只有在当前 range 内被 AI 添加才算 AI 删除
-                const isAI = aiLinesInRange.has(hash);
+                
+                // 新逻辑：如果提供了 allAiDeletes，优先使用它来判断
+                // 否则使用旧逻辑（只有在 range 内被 AI 添加的才算 AI 删除）
+                let isAI;
+                if (allAiDeletes !== null) {
+                    // 只要 AI 执行过删除操作，就算 AI 删除
+                    isAI = allAiDeletes.has(hash);
+                } else {
+                    // 旧逻辑：只有在当前 range 内被 AI 添加的行才算 AI 删除
+                    isAI = aiLinesInRange.has(hash);
+                }
+                
                 if (isAI) stats.ai_deleted++;
                 
                 changes.push({
@@ -114,22 +199,44 @@ function analyzeCommitRangeDiff(diffFile, allAiLines) {
 }
 
 /**
- * 分析完整文件的代码归属（基于内容哈希匹配）
+ * 分析完整文件的代码归属（基于内容哈希匹配，支持时间过滤）
  * @param {Array} lines - 文件的所有行
- * @param {Set} aiLinesSet - AI 生成行的哈希集合
+ * @param {Set|Map} aiLines - AI 生成行的哈希集合或映射 Map<hash, {timestamp, generation_id}>
+ * @param {Object} options - 可选配置
+ * @param {string} options.fileTimestamp - 文件/代码的时间戳，用于时间过滤（ISO格式字符串）
  * @returns {Object} - 包含逐行分析和统计
  */
-function analyzeFileAttribution(lines, aiLinesSet) {
+function analyzeFileAttribution(lines, aiLines, options = {}) {
+    const useTimeFilter = options.fileTimestamp && aiLines instanceof Map;
+
     const analysis = lines.map((content, index) => {
         const lineNumber = index + 1;
         const hash = hashLine(content);
-        const isAI = aiLinesSet.has(hash);
+        let isAI = false;
+        let generation_id = null;
+
+        if (aiLines instanceof Map) {
+            const aiInfo = aiLines.get(hash);
+            if (aiInfo) {
+                if (useTimeFilter) {
+                    // 时间过滤：只有在该行代码时间之前生成的 AI 才算
+                    isAI = aiInfo.timestamp <= options.fileTimestamp;
+                } else {
+                    // 不使用时间过滤，兼容旧逻辑
+                    isAI = true;
+                }
+                generation_id = aiInfo.generation_id;
+            }
+        } else {
+            // Set 类型，兼容旧逻辑
+            isAI = aiLines.has(hash);
+        }
 
         return {
             lineNumber,
             content,
             attribution: isAI ? 'ai' : 'human',
-            generation_id: null // 简化版本，不追踪具体 generation_id
+            generation_id
         };
     });
 
@@ -146,6 +253,9 @@ function analyzeFileAttribution(lines, aiLinesSet) {
 module.exports = {
     hashLine,
     buildAiLinesSet,
+    buildAiLinesMap,
+    buildAiDeletesSet,
+    buildAiDeletesMap,
     analyzeCommitRangeDiff,
     analyzeFileAttribution
 };

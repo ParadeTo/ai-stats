@@ -74,19 +74,21 @@ async function main() {
         const payload = {
             generation_id: metadata.generation_id || `gen-${Date.now()}`,
             user_id: userId,
-            repo_url: gitContext.repoUrl,
+            repo_url: gitContext.repoUrl, // 规范化后的远程仓库 URL
             branch_name: gitContext.branch,
             conversation_id: metadata.conversation_id,
             model: metadata.model || process.env.CURSOR_MODEL || 'unknown',
             compressed_diff: compressedDiff,
-            task_type: 'adhoc'
+            task_type: 'adhoc',
+            // 可选：同时保存原始 remote URL，便于调试
+            raw_repo_url: gitContext.rawRepoUrl !== gitContext.repoUrl ? gitContext.rawRepoUrl : undefined
         };
 
         // 记录 payload 详情（不包括压缩后的 diff，因为太长）
         log(`Payload prepared:
   - generation_id: ${payload.generation_id}
   - user_id: ${payload.user_id}
-  - repo_url: ${payload.repo_url}
+  - repo_url: ${payload.repo_url}${payload.raw_repo_url ? ` (normalized from: ${payload.raw_repo_url})` : ''}
   - branch_name: ${payload.branch_name}
   - conversation_id: ${payload.conversation_id}
   - model: ${payload.model}
@@ -194,17 +196,57 @@ function readStdin() {
 }
 
 /**
+ * 规范化 Git 仓库 URL
+ * 将 SSH 格式 (git@github.com:owner/repo.git) 转换为 HTTPS 格式 (https://github.com/owner/repo.git)
+ */
+function normalizeRepoUrl(url) {
+    if (!url || url === 'unknown') {
+        return url;
+    }
+    
+    // 如果已经是 HTTPS 格式，直接返回
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+        return url;
+    }
+    
+    // 处理 SSH 格式：git@github.com:owner/repo.git
+    const sshMatch = url.match(/git@([^:]+):(.+)/);
+    if (sshMatch) {
+        const host = sshMatch[1];
+        const path = sshMatch[2];
+        // 将常见 Git 托管平台的 SSH 格式转换为 HTTPS
+        if (host.includes('github.com')) {
+            return `https://github.com/${path}`;
+        } else if (host.includes('gitlab.com')) {
+            return `https://gitlab.com/${path}`;
+        } else if (host.includes('bitbucket.org')) {
+            return `https://bitbucket.org/${path}`;
+        } else {
+            // 其他 Git 服务器，尝试转换为 HTTPS
+            return `https://${host}/${path}`;
+        }
+    }
+    
+    // 如果无法识别格式，返回原值
+    return url;
+}
+
+/**
  * 获取 Git 仓库相关元数据
  */
 function getGitContext(cwd) {
     try {
-        const repoUrl = execSync('git config --get remote.origin.url', { cwd, encoding: 'utf8' }).trim();
+        const rawRepoUrl = execSync('git config --get remote.origin.url', { cwd, encoding: 'utf8' }).trim();
         const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd, encoding: 'utf8' }).trim();
-        log(`Git context: repo=${repoUrl}, branch=${branch}`);
-        return { repoUrl, branch };
+        
+        // 规范化仓库 URL
+        const repoUrl = normalizeRepoUrl(rawRepoUrl);
+        
+        log(`Git context: raw_repo=${rawRepoUrl}, normalized_repo=${repoUrl}, branch=${branch}`);
+        return { repoUrl, branch, rawRepoUrl };
     } catch (e) {
         log(`Git context error: ${e.message}`);
-        return { repoUrl: 'unknown', branch: 'unknown' };
+        return { repoUrl: 'unknown', branch: 'unknown', rawRepoUrl: 'unknown' };
     }
 }
 

@@ -19,10 +19,13 @@ interface Project {
   };
 }
 
+type RepoType = 'local' | 'github';
+
 function ProjectList() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [showBranchDiff, setShowBranchDiff] = useState(true);
+  const [repoType, setRepoType] = useState<RepoType>('github');
   const [repoPath, setRepoPath] = useState('');
   const navigate = useNavigate();
 
@@ -46,14 +49,33 @@ function ProjectList() {
     if (!repoPath) return;
     
     try {
-      const response = await axios.get('http://localhost:3001/api/branch-diff-stats', {
-        params: {
-          repo_path: repoPath,
-          branch: project.branch_name
-        }
-      });
-      
-      return response.data;
+      if (repoType === 'github') {
+        // 使用 GitHub API
+        const response = await axios.get('http://localhost:3001/api/github/analyze-commit-range', {
+          params: {
+            repo_url: repoPath,
+            base: 'main', // 默认与 main 分支比较
+            head: project.branch_name
+          }
+        });
+        
+        return {
+          base_branch: 'main',
+          ai_lines: response.data.summary.ai_lines,
+          total_added: response.data.summary.total_added,
+          ai_ratio: response.data.summary.ai_ratio
+        };
+      } else {
+        // 使用本地 Git API
+        const response = await axios.get('http://localhost:3001/api/branch-diff-stats', {
+          params: {
+            repo_path: repoPath,
+            branch: project.branch_name
+          }
+        });
+        
+        return response.data;
+      }
     } catch (error) {
       console.error('Error fetching branch diff:', error);
       return null;
@@ -62,7 +84,10 @@ function ProjectList() {
 
   const loadBranchDiffs = async () => {
     if (!repoPath) {
-      alert('Please enter local repository path first!');
+      const message = repoType === 'github' 
+        ? 'Please enter GitHub repository URL first!'
+        : 'Please enter local repository path first!';
+      alert(message);
       return;
     }
 
@@ -110,12 +135,41 @@ function ProjectList() {
       </header>
 
       <div className="controls-section">
+        <div className="repo-type-selector" style={{ marginBottom: '1rem' }}>
+          <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 600, color: '#374151' }}>
+            Repository Type:
+          </label>
+          <div style={{ display: 'flex', gap: '1rem' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                type="radio"
+                value="github"
+                checked={repoType === 'github'}
+                onChange={(e) => setRepoType(e.target.value as RepoType)}
+              />
+              GitHub Repository
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                type="radio"
+                value="local"
+                checked={repoType === 'local'}
+                onChange={(e) => setRepoType(e.target.value as RepoType)}
+              />
+              Local Repository
+            </label>
+          </div>
+        </div>
         <div className="repo-path-control">
-          <label>Local Repository Path (for branch diff):</label>
+          <label>
+            {repoType === 'github' ? 'GitHub Repository URL' : 'Local Repository Path'} (for branch diff):
+          </label>
           <div className="input-group">
             <input
               type="text"
-              placeholder="/Users/yourname/projects/repo-name"
+              placeholder={repoType === 'github' 
+                ? "https://github.com/owner/repo or owner/repo"
+                : "/Users/yourname/projects/repo-name"}
               value={repoPath}
               onChange={(e) => setRepoPath(e.target.value)}
             />

@@ -60,6 +60,16 @@ interface FileDiff {
   };
 }
 
+type RepoType = 'local' | 'github';
+
+interface GitHubCommit {
+  sha: string;
+  message: string;
+  author: string;
+  date: string;
+  url: string;
+}
+
 function FileDetail() {
   const { repoUrl, branch } = useParams<{ repoUrl: string; branch: string }>();
   const [files, setFiles] = useState<FileSummary[]>([]);
@@ -68,6 +78,7 @@ function FileDetail() {
   const [fileDiff, setFileDiff] = useState<FileDiff | null>(null);
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
+  const [repoType, setRepoType] = useState<RepoType>('github');
   const [repoPath, setRepoPath] = useState('');
   const [commits, setCommits] = useState<Commit[]>([]);
   const [fromCommit, setFromCommit] = useState('');
@@ -75,26 +86,63 @@ function FileDetail() {
   const [useCommitRange, setUseCommitRange] = useState(false);
   const navigate = useNavigate();
 
+  // 当切换到 GitHub 模式时，自动填充 repoUrl
   useEffect(() => {
-    if (useCommitRange && repoPath) {
+    if (repoType === 'github' && repoUrl && !repoPath) {
+      setRepoPath(decodeURIComponent(repoUrl));
+    }
+  }, [repoType, repoUrl]);
+
+  useEffect(() => {
+    if (useCommitRange && (repoPath || repoType === 'github')) {
       fetchCommits();
     } else {
       fetchFiles();
     }
-  }, [repoUrl, branch, useCommitRange]);
+  }, [repoUrl, branch, useCommitRange, repoType]);
 
   const fetchCommits = async () => {
-    if (!repoPath) return;
+    if (repoType === 'github' && !repoUrl) return;
+    if (repoType === 'local' && !repoPath) return;
     
     try {
-      const response = await axios.get('http://localhost:3001/api/commits', {
-        params: { repo_path: repoPath, branch, limit: 100 }
-      });
-      setCommits(response.data);
-      if (response.data.length > 0) {
-        setToCommit('HEAD');
-        if (response.data.length > 1) {
-          setFromCommit(response.data[Math.min(10, response.data.length - 1)].hash);
+      if (repoType === 'github') {
+        // 使用 GitHub API
+        const decodedRepoUrl = repoPath || decodeURIComponent(repoUrl!);
+        const response = await axios.get<{ commits: GitHubCommit[] }>('http://localhost:3001/api/github/commits', {
+          params: { 
+            repo_url: decodedRepoUrl,
+            branch: decodeURIComponent(branch!),
+            per_page: 100
+          }
+        });
+        
+        const formattedCommits: Commit[] = response.data.commits.map(c => ({
+          hash: c.sha,
+          shortHash: c.sha.substring(0, 7),
+          author: c.author,
+          date: c.date,
+          message: c.message
+        }));
+        
+        setCommits(formattedCommits);
+        if (formattedCommits.length > 0) {
+          setToCommit('HEAD');
+          if (formattedCommits.length > 1) {
+            setFromCommit(formattedCommits[Math.min(10, formattedCommits.length - 1)].hash);
+          }
+        }
+      } else {
+        // 使用本地 Git API
+        const response = await axios.get('http://localhost:3001/api/commits', {
+          params: { repo_path: repoPath, branch, limit: 100 }
+        });
+        setCommits(response.data);
+        if (response.data.length > 0) {
+          setToCommit('HEAD');
+          if (response.data.length > 1) {
+            setFromCommit(response.data[Math.min(10, response.data.length - 1)].hash);
+          }
         }
       }
     } catch (error) {
@@ -103,8 +151,18 @@ function FileDetail() {
   };
 
   const fetchCommitRangeStats = async () => {
-    if (!repoPath || !fromCommit) {
-      alert('Please enter repo path and select commits!');
+    if (!fromCommit) {
+      alert('Please select commits!');
+      return;
+    }
+    
+    if (repoType === 'github' && !repoPath && !repoUrl) {
+      alert('Please enter GitHub repository URL!');
+      return;
+    }
+    
+    if (repoType === 'local' && !repoPath) {
+      alert('Please enter local repository path!');
       return;
     }
 
@@ -115,10 +173,24 @@ function FileDetail() {
       setFileAnalysis(null);
       setFileDiff(null);
       
-      const response = await axios.get('http://localhost:3001/api/commit-range-stats', {
-        params: { repo_path: repoPath, from_commit: fromCommit, to_commit: toCommit }
-      });
-      setFiles(response.data.files);
+      if (repoType === 'github') {
+        // 使用 GitHub API
+        const decodedRepoUrl = repoPath || decodeURIComponent(repoUrl!);
+        const response = await axios.get('http://localhost:3001/api/github/analyze-commit-range', {
+          params: { 
+            repo_url: decodedRepoUrl,
+            base: fromCommit,
+            head: toCommit === 'HEAD' ? decodeURIComponent(branch!) : toCommit
+          }
+        });
+        setFiles(response.data.files);
+      } else {
+        // 使用本地 Git API
+        const response = await axios.get('http://localhost:3001/api/commit-range-stats', {
+          params: { repo_path: repoPath, from_commit: fromCommit, to_commit: toCommit }
+        });
+        setFiles(response.data.files);
+      }
     } catch (error) {
       console.error('Error fetching commit range stats:', error);
       alert('Failed to fetch commit range statistics');
@@ -146,7 +218,12 @@ function FileDetail() {
   };
 
   const handleFileClick = async (filePath: string) => {
-    if (!repoPath) {
+    if (repoType === 'github' && !repoPath && !repoUrl) {
+      alert('Please enter the GitHub repository URL first!');
+      return;
+    }
+    
+    if (repoType === 'local' && !repoPath) {
       alert('Please enter the local repository path first!');
       return;
     }
@@ -160,30 +237,64 @@ function FileDetail() {
       if (useCommitRange && fromCommit) {
         // Commit range mode: show diff between commits
         console.log('[FileDetail] Requesting diff:', { fromCommit, toCommit, filePath });
-        const response = await axios.get<FileDiff>(`http://localhost:3001/api/commit-range-file-diff`, {
-          params: {
-            repo_path: repoPath,
-            file_path: filePath,
-            from_commit: fromCommit,
-            to_commit: toCommit
-          }
-        });
-        console.log('[FileDetail] Received diff:', response.data);
-        setFileDiff(response.data);
+        
+        if (repoType === 'github') {
+          // 使用 GitHub API 获取文件 diff
+          const decodedRepoUrl = repoPath || decodeURIComponent(repoUrl!);
+          const response = await axios.get<FileDiff>(`http://localhost:3001/api/github/commit-range-file-diff`, {
+            params: {
+              repo_url: decodedRepoUrl,
+              file_path: filePath,
+              from_commit: fromCommit,
+              to_commit: toCommit === 'HEAD' ? decodeURIComponent(branch!) : toCommit
+            }
+          });
+          console.log('[FileDetail] Received diff:', response.data);
+          setFileDiff(response.data);
+        } else {
+          // 使用本地 Git API
+          const response = await axios.get<FileDiff>(`http://localhost:3001/api/commit-range-file-diff`, {
+            params: {
+              repo_path: repoPath,
+              file_path: filePath,
+              from_commit: fromCommit,
+              to_commit: toCommit
+            }
+          });
+          console.log('[FileDetail] Received diff:', response.data);
+          setFileDiff(response.data);
+        }
       } else {
         // Normal mode: show full file attribution
-        const response = await axios.get<FileAnalysis>(`http://localhost:3001/api/analyze-file`, {
-          params: {
-            repo_path: repoPath,
-            file_path: filePath
-          }
-        });
-        setFileAnalysis(response.data);
+        if (repoType === 'github') {
+          // 使用 GitHub API 分析文件
+          const decodedRepoUrl = repoPath || decodeURIComponent(repoUrl!);
+          const response = await axios.get<FileAnalysis>(`http://localhost:3001/api/github/analyze-file`, {
+            params: {
+              repo_url: decodedRepoUrl,
+              file_path: filePath,
+              branch: decodeURIComponent(branch!)
+            }
+          });
+          setFileAnalysis(response.data);
+        } else {
+          // 使用本地 Git API
+          const response = await axios.get<FileAnalysis>(`http://localhost:3001/api/analyze-file`, {
+            params: {
+              repo_path: repoPath,
+              file_path: filePath
+            }
+          });
+          setFileAnalysis(response.data);
+        }
       }
     } catch (error: any) {
       console.error('Error analyzing file:', error);
       const errorMsg = error.response?.data?.error || error.message || 'Unknown error';
-      alert(`Failed to analyze file:\n\n${errorMsg}\n\nPlease make sure:\n1. The repo path is a valid absolute path\n2. The path points to a git repository\n3. The file exists in the repository`);
+      const additionalInfo = repoType === 'github'
+        ? 'Please make sure:\n1. The GitHub repository URL is correct\n2. The repository is accessible\n3. The file exists in the repository\n4. GitHub token is configured in .env file'
+        : 'Please make sure:\n1. The repo path is a valid absolute path\n2. The path points to a git repository\n3. The file exists in the repository';
+      alert(`Failed to analyze file:\n\n${errorMsg}\n\n${additionalInfo}`);
     } finally {
       setAnalyzing(false);
     }
@@ -215,11 +326,46 @@ function FileDetail() {
       </header>
 
       <div className="config-section">
+        <div className="repo-type-selector" style={{ marginBottom: '1rem' }}>
+          <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 600, color: '#374151' }}>
+            Repository Type:
+          </label>
+          <div style={{ display: 'flex', gap: '1rem' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                type="radio"
+                value="github"
+                checked={repoType === 'github'}
+                onChange={(e) => {
+                  setRepoType(e.target.value as RepoType);
+                  // 如果是 GitHub，自动填充 repoUrl
+                  if (e.target.value === 'github' && repoUrl) {
+                    setRepoPath(decodeURIComponent(repoUrl));
+                  }
+                }}
+              />
+              GitHub Repository
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                type="radio"
+                value="local"
+                checked={repoType === 'local'}
+                onChange={(e) => setRepoType(e.target.value as RepoType)}
+              />
+              Local Repository
+            </label>
+          </div>
+        </div>
         <div className="repo-path-input">
-          <label>Local Repository Path:</label>
+          <label>
+            {repoType === 'github' ? 'GitHub Repository URL' : 'Local Repository Path'}:
+          </label>
           <input
             type="text"
-            placeholder="/Users/yourname/projects/repo-name"
+            placeholder={repoType === 'github'
+              ? "https://github.com/owner/repo or owner/repo"
+              : "/Users/yourname/projects/repo-name"}
             value={repoPath}
             onChange={(e) => setRepoPath(e.target.value)}
           />
@@ -232,7 +378,7 @@ function FileDetail() {
               checked={useCommitRange}
               onChange={(e) => {
                 setUseCommitRange(e.target.checked);
-                if (e.target.checked && repoPath) {
+                if (e.target.checked && (repoPath || (repoType === 'github' && repoUrl))) {
                   fetchCommits();
                 }
               }}
