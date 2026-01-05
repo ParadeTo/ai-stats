@@ -17,8 +17,8 @@
   - ✅ 返回固定长度（16字符）
   - ✅ 处理空行
 
-#### 2. `buildAiLinesSet(rows, zlib, parseDiff)` - 构建 AI 代码库
-- **功能**: 从数据库记录中提取所有 AI 生成行的哈希集合
+#### 2. `buildAiLinesMap(rows, zlib, parseDiff)` - 构建 AI 代码库（推荐）
+- **功能**: 从数据库记录中提取所有 AI 生成行的详细信息（哈希 → {timestamp, generation_id}）
 - **测试用例**:
   - ✅ 从压缩 diff 中提取 AI 添加的行
   - ✅ 忽略删除的行

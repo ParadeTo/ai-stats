@@ -1,14 +1,21 @@
 const {
     hashLine,
-    buildAiLinesSet,
     buildAiLinesMap,
-    buildAiDeletesSet,
     buildAiDeletesMap,
     analyzeCommitRangeDiff,
     analyzeFileAttribution
 } = require('../lib/codeAttribution');
 const zlib = require('zlib');
 const parseDiff = require('parse-diff');
+
+// 辅助函数：将旧的 rows 格式自动补充时间戳和 generation_id
+function normalizeRows(rows) {
+    return rows.map((row, index) => ({
+        compressed_diff: row.compressed_diff,
+        created_at: row.created_at || `2024-01-01T${String(index).padStart(2, '0')}:00:00Z`,
+        generation_id: row.generation_id || `gen-${index + 1}`
+    }));
+}
 
 describe('codeAttribution - 核心算法测试', () => {
     
@@ -70,7 +77,7 @@ describe('codeAttribution - 核心算法测试', () => {
             expect(info.generation_id).toBe('gen-123');
         });
 
-        it('应该只保存最早的 AI 生成记录', () => {
+        it('应该只保存最早的 AI 生成记录，并统计出现次数', () => {
             const diff1 = `diff --git a/test.js b/test.js
 @@ -0,0 +1,1 @@
 +console.log('hello');`;
@@ -99,91 +106,15 @@ describe('codeAttribution - 核心算法测试', () => {
             const hash = hashLine("console.log('hello');");
             const info = aiLinesMap.get(hash);
             
-            // 应该保存第一次出现的记录（gen-2）
-            expect(info.generation_id).toBe('gen-2');
-            expect(info.timestamp).toBe('2024-01-02T10:00:00Z');
-        });
-    });
-
-    describe('buildAiLinesSet', () => {
-        it('应该从压缩的 diff 中提取 AI 生成的行', () => {
-            const diff = `diff --git a/test.js b/test.js
-index 1234567..abcdefg 100644
---- a/test.js
-+++ b/test.js
-@@ -1,3 +1,4 @@
- function test() {
-+    console.log('AI generated');
-     return true;
- }`;
+            // 应该保存最早的时间戳（gen-1，2024-01-01）
+            expect(info.generation_id).toBe('gen-1');
+            expect(info.timestamp).toBe('2024-01-01T10:00:00Z');
             
-            const compressed = zlib.gzipSync(Buffer.from(diff)).toString('base64');
-            const rows = [{
-                compressed_diff: compressed
-            }];
-
-            const aiLinesSet = buildAiLinesSet(rows, zlib, parseDiff);
-            
-            expect(aiLinesSet.size).toBe(1);
-            expect(aiLinesSet.has(hashLine("console.log('AI generated');"))).toBe(true);
-        });
-
-        it('应该忽略删除的行', () => {
-            const diff = `diff --git a/test.js b/test.js
-index 1234567..abcdefg 100644
---- a/test.js
-+++ b/test.js
-@@ -1,4 +1,3 @@
- function test() {
--    console.log('old line');
-+    console.log('new line');
- }`;
-            
-            const compressed = zlib.gzipSync(Buffer.from(diff)).toString('base64');
-            const rows = [{ compressed_diff: compressed }];
-
-            const aiLinesSet = buildAiLinesSet(rows, zlib, parseDiff);
-            
-            expect(aiLinesSet.size).toBe(1);
-            expect(aiLinesSet.has(hashLine("console.log('new line');"))).toBe(true);
-            expect(aiLinesSet.has(hashLine("console.log('old line');"))).toBe(false);
-        });
-
-        it('应该处理多个文件的 diff', () => {
-            const diff = `diff --git a/file1.js b/file1.js
-index 1234567..abcdefg 100644
---- a/file1.js
-+++ b/file1.js
-@@ -1,1 +1,2 @@
- line1
-+line2
-diff --git a/file2.js b/file2.js
-index 1234567..abcdefg 100644
---- a/file2.js
-+++ b/file2.js
-@@ -1,1 +1,2 @@
- line3
-+line4`;
-            
-            const compressed = zlib.gzipSync(Buffer.from(diff)).toString('base64');
-            const rows = [{ compressed_diff: compressed }];
-
-            const aiLinesSet = buildAiLinesSet(rows, zlib, parseDiff);
-            
-            expect(aiLinesSet.size).toBe(2);
-            expect(aiLinesSet.has(hashLine('line2'))).toBe(true);
-            expect(aiLinesSet.has(hashLine('line4'))).toBe(true);
-        });
-
-        it('应该处理无效的压缩数据', () => {
-            const rows = [
-                { compressed_diff: 'invalid_base64' },
-                { compressed_diff: zlib.gzipSync(Buffer.from('valid diff')).toString('base64') }
-            ];
-
-            expect(() => {
-                buildAiLinesSet(rows, zlib, parseDiff);
-            }).not.toThrow();
+            // 应该记录出现次数
+            expect(info.count).toBe(2);
+            expect(info.occurrences.length).toBe(2);
+            expect(info.occurrences[0].generation_id).toBe('gen-2');
+            expect(info.occurrences[1].generation_id).toBe('gen-1');
         });
     });
 
@@ -287,7 +218,7 @@ index 1234567..abcdefg 100644
             const rows = [{ compressed_diff: compressed }];
 
             // 构建 AI 删除知识库
-            const allAiDeletes = buildAiDeletesSet(rows, zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(normalizeRows(rows), zlib, parseDiff);
             
             // 验证 AI 删除的行被正确提取
             expect(allAiDeletes.has(hashLine("console.log('debug');"))).toBe(true);
@@ -344,12 +275,12 @@ index 1234567..abcdefg 100644
                 '}'
             ];
 
-            const aiLinesSet = new Set([
-                hashLine('console.log("AI line");'),
-                hashLine('return true;')
+            const aiLinesMap = new Map([
+                [hashLine('console.log("AI line");'), { timestamp: '2024-01-01T10:00:00Z', generation_id: 'gen-1' }],
+                [hashLine('return true;'), { timestamp: '2024-01-01T10:00:00Z', generation_id: 'gen-1' }]
             ]);
 
-            const result = analyzeFileAttribution(lines, aiLinesSet);
+            const result = analyzeFileAttribution(lines, aiLinesMap);
 
             expect(result.stats.total_lines).toBe(4);
             expect(result.stats.ai_lines).toBe(2);
@@ -363,9 +294,11 @@ index 1234567..abcdefg 100644
 
         it('应该处理完全由 AI 生成的文件', () => {
             const lines = ['line1', 'line2', 'line3'];
-            const aiLinesSet = new Set(lines.map(hashLine));
+            const aiLinesMap = new Map(lines.map(line => 
+                [hashLine(line), { timestamp: '2024-01-01T10:00:00Z', generation_id: 'gen-1' }]
+            ));
 
-            const result = analyzeFileAttribution(lines, aiLinesSet);
+            const result = analyzeFileAttribution(lines, aiLinesMap);
 
             expect(result.stats.ai_lines).toBe(3);
             expect(result.stats.human_lines).toBe(0);
@@ -373,9 +306,9 @@ index 1234567..abcdefg 100644
 
         it('应该处理完全由人工编写的文件', () => {
             const lines = ['line1', 'line2', 'line3'];
-            const aiLinesSet = new Set();
+            const aiLinesMap = new Map();
 
-            const result = analyzeFileAttribution(lines, aiLinesSet);
+            const result = analyzeFileAttribution(lines, aiLinesMap);
 
             expect(result.stats.ai_lines).toBe(0);
             expect(result.stats.human_lines).toBe(3);
@@ -383,9 +316,9 @@ index 1234567..abcdefg 100644
 
         it('应该处理空文件', () => {
             const lines = [];
-            const aiLinesSet = new Set();
+            const aiLinesMap = new Map();
 
-            const result = analyzeFileAttribution(lines, aiLinesSet);
+            const result = analyzeFileAttribution(lines, aiLinesMap);
 
             expect(result.stats.total_lines).toBe(0);
             expect(result.stats.ai_lines).toBe(0);
@@ -518,7 +451,7 @@ index 1234567..abcdefg 100644
             const compressed = zlib.gzipSync(Buffer.from(historicalDiff)).toString('base64');
             const rows = [{ compressed_diff: compressed }];
             
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
             
             // Step 2: 用户在当前 range 删除了一行
             const currentDiff = `diff --git a/utils.js b/utils.js
@@ -555,7 +488,7 @@ index 1234567..abcdefg 100644
             const rows = [{ compressed_diff: compressed }];
             
             // 构建 AI 知识库：包含 "const result = await fetch(url);" 的哈希
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
             const targetLineHash = hashLine('const result = await fetch(url);');
             expect(allAiLines.has(targetLineHash)).toBe(true);
             
@@ -592,7 +525,7 @@ index 1234567..abcdefg 100644
 +async function delay(ms) { await sleep(ms); }`;
             
             const compressed = zlib.gzipSync(Buffer.from(aiDiff)).toString('base64');
-            const aiLinesSet = buildAiLinesSet([{ compressed_diff: compressed }], zlib, parseDiff);
+            const aiLinesMap = buildAiLinesMap([{ compressed_diff: compressed, created_at: '2024-01-01T10:00:00Z', generation_id: 'gen-1' }], zlib, parseDiff);
             
             // Step 2: 当前文件内容（假设经过删除后又重新添加）
             // 注意：由于 hashLine 会 trim()，所以所有 AI 行都会被识别
@@ -605,7 +538,7 @@ index 1234567..abcdefg 100644
                 'async function delay(ms) { await sleep(ms); }'                 // AI 生成（第5行）
             ];
             
-            const result = analyzeFileAttribution(currentFileLines, aiLinesSet);
+            const result = analyzeFileAttribution(currentFileLines, aiLinesMap);
             
             // 验证统计结果
             // 注意：由于 AI diff 包含了所有5行，它们都会被识别为 AI
@@ -629,7 +562,7 @@ index 1234567..abcdefg 100644
 +    console.log('test');`;
             
             const compressed = zlib.gzipSync(Buffer.from(aiDiff)).toString('base64');
-            const allAiLines = buildAiLinesSet([{ compressed_diff: compressed }], zlib, parseDiff);
+            const allAiLines = buildAiLinesMap([{ compressed_diff: compressed, created_at: '2024-01-01T10:00:00Z', generation_id: 'gen-1' }], zlib, parseDiff);
             
             // Step 2: 用户重新添加时改变了缩进
             const userDiff = `diff --git a/test.js b/test.js
@@ -666,7 +599,7 @@ index 1234567..abcdefg 100644
  }`;
             
             const compressed = zlib.gzipSync(Buffer.from(aiDiff)).toString('base64');
-            const allAiLines = buildAiLinesSet([{ compressed_diff: compressed }], zlib, parseDiff);
+            const allAiLines = buildAiLinesMap([{ compressed_diff: compressed, created_at: '2024-01-01T10:00:00Z', generation_id: 'gen-1' }], zlib, parseDiff);
             
             // Step 2: 分析一个文件，其中包含多行 return null（有些是人工写的）
             const fileLines = [
@@ -720,7 +653,7 @@ index 1234567..abcdefg 100644
 +    console.log("hello");`;
             
             const compressed = zlib.gzipSync(Buffer.from(aiDiff)).toString('base64');
-            const allAiLines = buildAiLinesSet([{ compressed_diff: compressed }], zlib, parseDiff);
+            const allAiLines = buildAiLinesMap([{ compressed_diff: compressed, created_at: '2024-01-01T10:00:00Z', generation_id: 'gen-1' }], zlib, parseDiff);
             
             // 现在分析 Day 1 的文件，它完全是人工写的
             const result = analyzeFileAttribution(manualLines, allAiLines);
@@ -745,7 +678,7 @@ index 1234567..abcdefg 100644
 +return null;`;
             
             const compressed = zlib.gzipSync(Buffer.from(aiDiff)).toString('base64');
-            const allAiLines = buildAiLinesSet([{ compressed_diff: compressed }], zlib, parseDiff);
+            const allAiLines = buildAiLinesMap([{ compressed_diff: compressed, created_at: '2024-01-01T10:00:00Z', generation_id: 'gen-1' }], zlib, parseDiff);
             
             // 验证 AI 知识库包含了这些模式
             expect(allAiLines.has(hashLine('if (!data) {'))).toBe(true);
@@ -795,8 +728,8 @@ index 1234567..abcdefg 100644
             const rows = [{ compressed_diff: compressed }];
             
             // 构建 AI 知识库
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
-            const allAiDeletes = buildAiDeletesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(normalizeRows(rows), zlib, parseDiff);
             
             // 验证 AI 删除知识库（应该是空的，因为 AI 没有删除操作）
             expect(allAiDeletes.size).toBe(0);
@@ -846,8 +779,8 @@ index 1234567..abcdefg 100644
                 { compressed_diff: zlib.gzipSync(Buffer.from(aiDel)).toString('base64') }
             ];
             
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
-            const allAiDeletes = buildAiDeletesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(normalizeRows(rows), zlib, parseDiff);
             
             // 验证 AI 添加了 3 行
             expect(allAiLines.size).toBe(3);
@@ -904,8 +837,8 @@ index 1234567..abcdefg 100644
             const rows = [{ compressed_diff: compressed }];
             
             // 构建 AI 知识库
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
-            const allAiDeletes = buildAiDeletesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(normalizeRows(rows), zlib, parseDiff);
             
             // 验证：AI 删除知识库应该包含这两行
             expect(allAiDeletes.size).toBe(2);
@@ -949,8 +882,8 @@ index 1234567..abcdefg 100644
 +const x = 1;`;
             
             const rowsA = [{ compressed_diff: zlib.gzipSync(Buffer.from(aiAdd)).toString('base64') }];
-            const aiLinesA = buildAiLinesSet(rowsA, zlib, parseDiff);
-            const aiDeletesA = buildAiDeletesSet(rowsA, zlib, parseDiff);
+            const aiLinesA = buildAiLinesMap(normalizeRows(rowsA), zlib, parseDiff);
+            const aiDeletesA = buildAiDeletesMap(normalizeRows(rowsA), zlib, parseDiff);
             
             expect(aiLinesA.size).toBe(1); // AI 添加了 1 行
             expect(aiDeletesA.size).toBe(0); // AI 没有删除
@@ -974,8 +907,8 @@ index 1234567..abcdefg 100644
 -const y = 2;`;
             
             const rowsB = [{ compressed_diff: zlib.gzipSync(Buffer.from(aiDel)).toString('base64') }];
-            const aiLinesB = buildAiLinesSet(rowsB, zlib, parseDiff);
-            const aiDeletesB = buildAiDeletesSet(rowsB, zlib, parseDiff);
+            const aiLinesB = buildAiLinesMap(normalizeRows(rowsB), zlib, parseDiff);
+            const aiDeletesB = buildAiDeletesMap(normalizeRows(rowsB), zlib, parseDiff);
             
             expect(aiLinesB.size).toBe(0); // AI 没有添加
             expect(aiDeletesB.size).toBe(1); // AI 删除了 1 行
@@ -1011,8 +944,8 @@ index 1234567..abcdefg 100644
  }`;
             
             const rows = [{ compressed_diff: zlib.gzipSync(Buffer.from(aiMistake)).toString('base64') }];
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
-            const allAiDeletes = buildAiDeletesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(normalizeRows(rows), zlib, parseDiff);
             
             // Day 2: 开发者恢复代码
             const humanRestore = `diff --git a/important.js b/important.js
@@ -1074,8 +1007,8 @@ index 1234567..abcdefg 100644
             ];
             
             // 构建 AI 知识库
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
-            const allAiDeletes = buildAiDeletesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(normalizeRows(rows), zlib, parseDiff);
             
             // 验证知识库状态
             expect(allAiLines.size).toBe(3); // AI 添加了 3 行
@@ -1125,8 +1058,8 @@ index 1234567..abcdefg 100644
 -const x = 1;`)).toString('base64') }
             ];
             
-            const aiLinesA = buildAiLinesSet(aiAddThenDel, zlib, parseDiff);
-            const aiDeletesA = buildAiDeletesSet(aiAddThenDel, zlib, parseDiff);
+            const aiLinesA = buildAiLinesMap(normalizeRows(aiAddThenDel), zlib, parseDiff);
+            const aiDeletesA = buildAiDeletesMap(normalizeRows(aiAddThenDel), zlib, parseDiff);
             
             expect(aiLinesA.size).toBe(1); // AI 添加了
             expect(aiDeletesA.size).toBe(1); // AI 也删除了
@@ -1146,8 +1079,8 @@ index 1234567..abcdefg 100644
 -const y = 2;`)).toString('base64') }
             ];
             
-            const aiLinesB = buildAiLinesSet(aiOnlyDel, zlib, parseDiff);
-            const aiDeletesB = buildAiDeletesSet(aiOnlyDel, zlib, parseDiff);
+            const aiLinesB = buildAiLinesMap(normalizeRows(aiOnlyDel), zlib, parseDiff);
+            const aiDeletesB = buildAiDeletesMap(normalizeRows(aiOnlyDel), zlib, parseDiff);
             
             expect(aiLinesB.size).toBe(0); // AI 从未添加
             expect(aiDeletesB.size).toBe(1); // AI 删除了
@@ -1194,8 +1127,8 @@ index 1234567..abcdefg 100644
                 { compressed_diff: zlib.gzipSync(Buffer.from(aiRefactor)).toString('base64') }
             ];
             
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
-            const allAiDeletes = buildAiDeletesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(normalizeRows(rows), zlib, parseDiff);
             
             // 人工回滚
             const rollbackFile = parseDiff(humanRollback)[0];
@@ -1220,6 +1153,330 @@ index 1234567..abcdefg 100644
             
             // 这是已知的限制：内容相同就被视为 AI
             console.log('已知限制：人工回滚 AI 代码，仍被识别为 AI 代码');
+        });
+
+        it('应该正确处理"AI 添加一行 + 人工删除另一行相同代码"的场景（历史 AI）', () => {
+            // 场景：文件中有多行相同的代码
+            // 历史上：AI 在第 5 行添加了 console.log('debug');
+            // 当前：人工删除了第 2 行的 console.log('debug');
+            
+            // 历史：AI 添加（不在当前 commit range）
+            const historicalAiAdd = `diff --git a/app.js b/app.js
+@@ -4,0 +5,1 @@
++console.log('debug');`;
+            
+            const rows = [
+                { compressed_diff: zlib.gzipSync(Buffer.from(historicalAiAdd)).toString('base64') }
+            ];
+            
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(normalizeRows(rows), zlib, parseDiff);
+            
+            // 验证：AI 添加知识库有这行
+            expect(allAiLines.has(hashLine("console.log('debug');"))).toBe(true);
+            expect(allAiDeletes.has(hashLine("console.log('debug');"))).toBe(false);
+            
+            // 当前 commit range：人工删除另一行相同代码
+            const currentHumanDel = `diff --git a/app.js b/app.js
+@@ -2,1 +1,0 @@
+-console.log('debug');`;
+            
+            const delFile = parseDiff(currentHumanDel)[0];
+            const result = analyzeCommitRangeDiff(delFile, allAiLines, allAiDeletes);
+            
+            // 关键验证：人工删除会被误判为 AI 删除！
+            // 因为 allAiLines 包含这个 hash（AI 曾添加过相同内容）
+            expect(result.stats.deleted).toBe(1);
+            expect(result.stats.ai_deleted).toBe(0); // 不算 AI 删除，因为不在 aiLinesInRange 且不在 allAiDeletes
+            
+            const delChange = result.changes.find(c => c.type === 'del');
+            expect(delChange.isAI).toBe(false); // 标记为人工删除
+            
+            console.log('场景：AI 在第 5 行添加，人工删除第 2 行（相同内容）');
+            console.log('结果：正确识别为人工删除（因为不在 allAiDeletes）');
+        });
+
+        it('应该展示多行相同代码的复杂交互场景', () => {
+            // 场景：文件中有 3 行 console.log('test');
+            // 历史：AI 添加了其中 1 行
+            // 历史：AI 删除了其中 1 行（可能是同一行，也可能是不同行）
+            // 当前：人工删除了第 3 行
+            
+            const aiHistory = [
+                // AI 添加
+                { compressed_diff: zlib.gzipSync(Buffer.from(`diff --git a/test.js b/test.js
+@@ -0,0 +1,1 @@
++console.log('test');`)).toString('base64') },
+                // AI 删除
+                { compressed_diff: zlib.gzipSync(Buffer.from(`diff --git a/test.js b/test.js
+@@ -1,1 +0,0 @@
+-console.log('test');`)).toString('base64') }
+            ];
+            
+            const allAiLines = buildAiLinesMap(aiHistory, zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(aiHistory, zlib, parseDiff);
+            
+            // 验证知识库
+            const testHash = hashLine("console.log('test');");
+            expect(allAiLines.has(testHash)).toBe(true);    // AI 添加过
+            expect(allAiDeletes.has(testHash)).toBe(true);  // AI 删除过
+            
+            // 当前：人工删除第 3 行
+            const humanDel = `diff --git a/test.js b/test.js
+@@ -10,1 +9,0 @@
+-console.log('test');`;
+            
+            const result = analyzeCommitRangeDiff(
+                parseDiff(humanDel)[0],
+                allAiLines,
+                allAiDeletes
+            );
+            
+            // 验证：会被误判为 AI 删除
+            // 因为 allAiDeletes 包含这个 hash
+            expect(result.stats.deleted).toBe(1);
+            expect(result.stats.ai_deleted).toBe(1); // 误判：实际是人工删除第 3 行
+            
+            console.log('误判原因：AI 曾删除过相同内容的另一行');
+            console.log('系统无法区分"删除第 2 行"和"删除第 10 行"（内容相同）');
+        });
+
+        it('应该展示文件级别分析中的多行相同代码问题', () => {
+            // 场景：最终文件中有 3 行 return true;
+            // - 第 1 行：人工编写
+            // - 第 2 行：AI 生成
+            // - 第 3 行：人工编写（但内容与 AI 生成的相同）
+            
+            const aiAdd = `diff --git a/utils.js b/utils.js
+@@ -5,0 +6,1 @@
++    return true;`;
+            
+            const rows = [
+                { compressed_diff: zlib.gzipSync(Buffer.from(aiAdd)).toString('base64') }
+            ];
+            
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
+            
+            // 最终文件内容
+            const fileLines = [
+                'function check1() {',
+                '    return true;',  // 人工
+                '}',
+                'function check2() {',
+                '    return true;',  // AI 生成
+                '}',
+                'function check3() {',
+                '    return true;',  // 人工，但与 AI 相同
+                '}'
+            ];
+            
+            const result = analyzeFileAttribution(fileLines, allAiLines);
+            
+            // 问题：3 行 return true; 都被标记为 AI
+            const returnLines = result.analysis.filter(
+                l => l.content.includes('return true')
+            );
+            
+            expect(returnLines.length).toBe(3);
+            returnLines.forEach(line => {
+                expect(line.attribution).toBe('ai'); // 全部标记为 AI
+            });
+            
+            // 统计
+            expect(result.stats.ai_lines).toBe(3); // 3 行被算作 AI
+            expect(result.stats.human_lines).toBe(6); // 其他 6 行
+            
+            console.log('已知限制：无法区分多行相同代码的不同来源');
+            console.log('实际：1 行 AI + 2 行人工');
+            console.log('识别：3 行全部标记为 AI');
+        });
+
+        it('应该展示使用 Map + 时间过滤可以缓解多行相同代码的误判', () => {
+            // 对比场景：同样是 3 行 return true;
+            // 但如果使用时间过滤，可以更准确地判断
+            
+            // Day 1 (2023-01-01): 人工写了 check1 和 check3
+            // Day 2 (2023-01-05): AI 生成了 check2
+            
+            const aiAdd = `diff --git a/utils.js b/utils.js
+@@ -5,0 +6,1 @@
++    return true;`;
+            
+            const rows = [
+                { 
+                    compressed_diff: zlib.gzipSync(Buffer.from(aiAdd)).toString('base64'),
+                    created_at: '2023-01-05T10:00:00Z',
+                    generation_id: 'ai-gen-1'
+                }
+            ];
+            
+            // 使用 Map 而不是 Set
+            const aiLinesMap = buildAiLinesMap(rows, zlib, parseDiff);
+            
+            // 场景 A：分析 Day 1 的文件（AI 生成之前）
+            const fileTimestampDay1 = '2023-01-01T12:00:00Z';
+            const fileLinesDay1 = [
+                'function check1() {',
+                '    return true;',  // 人工，Day 1
+                '}',
+                'function check3() {',
+                '    return true;',  // 人工，Day 1
+                '}'
+            ];
+            
+            const resultDay1 = analyzeFileAttribution(fileLinesDay1, aiLinesMap, {
+                fileTimestamp: fileTimestampDay1
+            });
+            
+            // 验证：由于 AI 生成时间在文件时间之后，不会误判
+            expect(resultDay1.stats.ai_lines).toBe(0);  // ✅ 正确！
+            expect(resultDay1.stats.human_lines).toBe(6);
+            
+            console.log('使用时间过滤：Day 1 文件 (AI 生成前) -> ai_lines = 0 ✅');
+            
+            // 场景 B：分析 Day 10 的文件（AI 生成之后）
+            const fileTimestampDay10 = '2023-01-10T12:00:00Z';
+            const fileLinesDay10 = [
+                'function check1() {',
+                '    return true;',  // 人工，Day 1
+                '}',
+                'function check2() {',
+                '    return true;',  // AI 生成，Day 2
+                '}',
+                'function check3() {',
+                '    return true;',  // 人工，Day 1
+                '}'
+            ];
+            
+            const resultDay10 = analyzeFileAttribution(fileLinesDay10, aiLinesMap, {
+                fileTimestamp: fileTimestampDay10
+            });
+            
+            // 验证：AI 生成时间在文件时间之前，所以会标记
+            expect(resultDay10.stats.ai_lines).toBe(3);  // ❌ 仍然误判
+            expect(resultDay10.stats.human_lines).toBe(6);
+            
+            console.log('使用时间过滤：Day 10 文件 (AI 生成后) -> ai_lines = 3 ❌');
+            console.log('时间过滤只能避免"未来 AI"的误判，无法区分同时代的相同代码');
+            
+            // 对比：不使用时间过滤
+            const resultNoFilter = analyzeFileAttribution(fileLinesDay1, aiLinesMap);  // 不传 fileTimestamp
+            
+            expect(resultNoFilter.stats.ai_lines).toBe(2);  // Day 1 的代码也被误判
+            
+            console.log('不使用时间过滤：Day 1 文件 -> ai_lines = 2 ❌（更严重的误判）');
+        });
+
+        it('应该展示行号无关性的设计优势', () => {
+            // 场景：验证即使行号变化，仍能正确识别
+            
+            // AI 在第 10 行添加代码
+            const aiAddLine10 = `diff --git a/file.js b/file.js
+@@ -9,0 +10,1 @@
++const config = { port: 3000 };`;
+            
+            const rows = [
+                { compressed_diff: zlib.gzipSync(Buffer.from(aiAddLine10)).toString('base64') }
+            ];
+            
+            const allAiLines = buildAiLinesMap(normalizeRows(rows), zlib, parseDiff);
+            
+            // 后来代码重构，这行变成了第 25 行
+            const fileLines = Array(24).fill('// other code');
+            fileLines.push('const config = { port: 3000 };');
+            fileLines.push('// more code');
+            
+            const result = analyzeFileAttribution(fileLines, allAiLines);
+            
+            // 验证：即使行号从 10 变成 25，仍能识别
+            const configLine = result.analysis[24]; // 第 25 行（索引 24）
+            expect(configLine.content).toBe('const config = { port: 3000 };');
+            expect(configLine.attribution).toBe('ai'); // 正确识别为 AI
+            
+            console.log('优势：基于内容哈希，不依赖行号');
+            console.log('即使代码移动、文件重构，仍能正确归属');
+        });
+
+        it('应该检测并报告重复代码的统计信息', () => {
+            // 场景：AI 生成了 2 次 return true;，但文件中有 4 行
+            const aiDiff1 = `diff --git a/test.js b/test.js
+@@ -0,0 +1,1 @@
++    return true;`;
+            
+            const aiDiff2 = `diff --git a/test.js b/test.js
+@@ -0,0 +1,1 @@
++    return true;`;
+            
+            const rows = [
+                { compressed_diff: zlib.gzipSync(Buffer.from(aiDiff1)).toString('base64'), created_at: '2024-01-01T10:00:00Z', generation_id: 'gen-1' },
+                { compressed_diff: zlib.gzipSync(Buffer.from(aiDiff2)).toString('base64'), created_at: '2024-01-01T11:00:00Z', generation_id: 'gen-2' }
+            ];
+            
+            const aiLinesMap = buildAiLinesMap(rows, zlib, parseDiff);
+            
+            // 验证 count
+            const hash = hashLine('return true;');
+            const aiInfo = aiLinesMap.get(hash);
+            expect(aiInfo.count).toBe(2);
+            
+            // 文件中有 4 行 return true;
+            const fileLines = [
+                'function test1() {',
+                '    return true;',
+                '}',
+                'function test2() {',
+                '    return true;',
+                '}',
+                'function test3() {',
+                '    return true;',
+                '}',
+                'function test4() {',
+                '    return true;',
+                '}'
+            ];
+            
+            const result = analyzeFileAttribution(fileLines, aiLinesMap);
+            
+            // 验证基本统计
+            expect(result.stats.total_lines).toBe(12);
+            expect(result.stats.ai_lines).toBe(4);  // 所有 return true; 都被标记为 AI
+            
+            // 验证警告信息
+            expect(result.warning).toBeDefined();
+            expect(result.warning).toContain('重复代码');
+            
+            // 验证 duplicateStats
+            expect(result.duplicateStats).toBeDefined();
+            const dupStat = result.duplicateStats[hash];
+            expect(dupStat).toBeDefined();
+            expect(dupStat.total_in_file).toBe(4);
+            expect(dupStat.ai_count).toBe(2);
+            expect(dupStat.estimated_ai_lines).toBe(2);
+            expect(dupStat.estimated_human_lines).toBe(2);
+            expect(dupStat.content.trim()).toBe('return true;');
+            expect(dupStat.note).toContain('可能有 2 行是人工编写');
+            
+            console.log('duplicateStats:', JSON.stringify(dupStat, null, 2));
+        });
+
+        it('应该在没有重复代码时不显示警告', () => {
+            // AI 生成了 1 次，文件中有 1 行
+            const aiDiff = `diff --git a/test.js b/test.js
+@@ -0,0 +1,1 @@
++const x = 1;`;
+            
+            const rows = [
+                { compressed_diff: zlib.gzipSync(Buffer.from(aiDiff)).toString('base64'), created_at: '2024-01-01T10:00:00Z', generation_id: 'gen-1' }
+            ];
+            
+            const aiLinesMap = buildAiLinesMap(rows, zlib, parseDiff);
+            const fileLines = ['const x = 1;'];
+            
+            const result = analyzeFileAttribution(fileLines, aiLinesMap);
+            
+            // 没有重复代码，不应该有警告
+            expect(result.warning).toBeUndefined();
+            expect(result.duplicateStats).toBeUndefined();
         });
     });
 });

@@ -66,7 +66,7 @@ function initializeHooks(context: vscode.ExtensionContext) {
     // 确保 hooks 字段存在
     if (!config.hooks) {
       config.hooks = {}
-    }
+      }
 
     let needsUpdate = false
 

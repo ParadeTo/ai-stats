@@ -11,7 +11,7 @@ const parseDiff = require('parse-diff');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
 const GitHubApi = require('./lib/githubApi');
-const { buildAiLinesSet, buildAiDeletesSet, analyzeCommitRangeDiff, analyzeFileAttribution, hashLine } = require('./lib/codeAttribution');
+const { buildAiLinesMap, buildAiDeletesMap, analyzeCommitRangeDiff, analyzeFileAttribution, hashLine } = require('./lib/codeAttribution');
 
 const app = express();
 const port = 3001;
@@ -36,6 +36,25 @@ db.serialize(() => {
         task_type TEXT DEFAULT 'adhoc',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
+    
+    // 手动标记表
+    db.run(`CREATE TABLE IF NOT EXISTS manual_attributions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_url TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        commit_hash TEXT,
+        line_number INTEGER NOT NULL,
+        content_hash TEXT NOT NULL,
+        attribution TEXT NOT NULL CHECK(attribution IN ('ai', 'human')),
+        user_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(repo_url, file_path, branch, line_number)
+    )`);
+    
+    db.run(`CREATE INDEX IF NOT EXISTS idx_manual_attr_lookup 
+        ON manual_attributions(repo_url, file_path, branch)`);
 });
 
 app.get('/', (req, res) => {
@@ -916,34 +935,98 @@ app.get('/api/github/analyze-commit-range', async (req, res) => {
 
         // 3. 从数据库获取 AI 代码知识库
         const repoName = path.basename(repo_url.replace('.git', ''));
-        db.all('SELECT * FROM task_records WHERE repo_url LIKE ?', [`%${repoName}%`], (err, rows) => {
+        db.all('SELECT * FROM task_records WHERE repo_url LIKE ?', [`%${repoName}%`], async (err, rows) => {
             if (err) {
                 return res.status(500).json({ error: 'Database error' });
             }
 
-            // 4. 构建 AI 代码知识库
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
+            // 4. 构建 AI 代码知识库（包括添加和删除）
+            const allAiLines = buildAiLinesMap(rows, zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(rows, zlib, parseDiff);
 
-            // 5. 分析每个文件的变更
+            // 5. 获取手动标记（按文件路径分组）
+            const branch = head.includes('/') ? head.split('/').pop() : head;
+            const manualAttrs = await new Promise((resolve, reject) => {
+                db.all(
+                    `SELECT file_path, line_number, content_hash, attribution 
+                     FROM manual_attributions 
+                     WHERE repo_url = ? AND branch = ?`,
+                    [repo_url, branch],
+                    (err, rows) => {
+                        if (err) reject(err);
+                        else resolve(rows || []);
+                    }
+                );
+            });
+
+            // 按文件路径分组手动标记（按行号索引，包含内容哈希用于验证）
+            const manualMapsByFile = new Map();
+            manualAttrs.forEach(m => {
+                if (!manualMapsByFile.has(m.file_path)) {
+                    manualMapsByFile.set(m.file_path, new Map());
+                }
+                manualMapsByFile.get(m.file_path).set(m.line_number, {
+                    attribution: m.attribution,
+                    content_hash: m.content_hash
+                });
+            });
+
+            // 6. 分析每个文件的变更
             const fileStats = [];
             let totalAiAdded = 0;
             let totalAdded = 0;
             let totalDeleted = 0;
 
             files.forEach(file => {
-                const { changes, stats } = analyzeCommitRangeDiff(file, allAiLines);
+                const filePath = file.to || file.from;
+                
+                // 获取该文件的手动标记
+                const manualMap = manualMapsByFile.get(filePath) || new Map();
+                
+                // 分析文件 diff
+                const { changes, stats } = analyzeCommitRangeDiff(file, allAiLines, allAiDeletes);
+                
+                // 应用手动标记（行号和内容都必须匹配）
+                const updatedChanges = changes.map(change => {
+                    const manual = manualMap.get(change.lineNumber);
+                    if (manual) {
+                        const hash = hashLine(change.content);
+                        if (manual.content_hash === hash) {
+                            // 行号和内容都匹配，应用手动标记
+                            return {
+                                ...change,
+                                isAI: manual.attribution === 'ai',
+                                isManual: true,
+                                autoAttribution: change.isAI ? 'ai' : 'human'
+                            };
+                        }
+                        // 行号匹配但内容不匹配，标记为失效
+                        return {
+                            ...change,
+                            manualInvalid: true
+                        };
+                    }
+                    return change;
+                });
+                
+                // 重新计算统计（考虑手动标记）
+                const finalStats = {
+                    ai_added: updatedChanges.filter(c => c.type === 'add' && c.isAI).length,
+                    added: stats.added,
+                    deleted: stats.deleted
+                };
                 
                 fileStats.push({
-                    file_path: file.to || file.from,
-                    ai_lines: stats.ai_added,
-                    added_lines: stats.added,
-                    deleted_lines: stats.deleted,
-                    ai_ratio: stats.added > 0 ? (stats.ai_added / stats.added * 100) : 0
+                    file_path: filePath,
+                    ai_lines: finalStats.ai_added,
+                    added_lines: finalStats.added,
+                    deleted_lines: finalStats.deleted,
+                    ai_ratio: finalStats.added > 0 ? (finalStats.ai_added / finalStats.added * 100) : 0
                 });
 
-                totalAiAdded += stats.ai_added;
-                totalAdded += stats.added;
-                totalDeleted += stats.deleted;
+                totalAiAdded += finalStats.ai_added;
+                totalAdded += finalStats.added;
+                totalDeleted += finalStats.deleted;
             });
 
             res.json({
@@ -956,7 +1039,8 @@ app.get('/api/github/analyze-commit-range', async (req, res) => {
                     total_added: totalAdded,
                     total_deleted: totalDeleted,
                     ai_ratio: totalAdded > 0 ? (totalAiAdded / totalAdded * 100) : 0
-                }
+                },
+                hasManualAttributions: manualAttrs.length > 0
             });
         });
     } catch (error) {
@@ -1003,24 +1087,79 @@ app.get('/api/github/commit-range-file-diff', async (req, res) => {
 
         // 3. 从数据库获取 AI 代码知识库
         const repoName = path.basename(repo_url.replace('.git', ''));
-        db.all('SELECT * FROM task_records WHERE repo_url LIKE ?', [`%${repoName}%`], (err, rows) => {
+        db.all('SELECT * FROM task_records WHERE repo_url LIKE ?', [`%${repoName}%`], async (err, rows) => {
             if (err) {
                 return res.status(500).json({ error: 'Database error' });
             }
 
             // 4. 构建 AI 代码知识库（包括添加和删除）
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
-            const allAiDeletes = buildAiDeletesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(rows, zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(rows, zlib, parseDiff);
 
-            // 5. 分析文件 diff（传入 allAiDeletes 以支持识别 AI 删除操作）
+            // 5. 获取手动标记
+            const branch = head.includes('/') ? head.split('/').pop() : head;
+            const manualAttrs = await new Promise((resolve, reject) => {
+                db.all(
+                    `SELECT line_number, content_hash, attribution 
+                     FROM manual_attributions 
+                     WHERE repo_url = ? AND file_path = ? AND branch = ?`,
+                    [repo_url, file_path, branch],
+                    (err, rows) => {
+                        if (err) reject(err);
+                        else resolve(rows || []);
+                    }
+                );
+            });
+
+            // 构建手动标记 Map（按行号索引，验证内容哈希）
+            const manualMap = new Map(
+                manualAttrs.map(m => [m.line_number, {
+                    attribution: m.attribution,
+                    content_hash: m.content_hash
+                }])
+            );
+
+            // 6. 分析文件 diff（传入 allAiDeletes 以支持识别 AI 删除操作）
             const { changes, stats } = analyzeCommitRangeDiff(targetFile, allAiLines, allAiDeletes);
+
+            // 7. 应用手动标记（行号和内容都必须匹配）
+            const updatedChanges = changes.map(change => {
+                const manual = manualMap.get(change.lineNumber);
+                if (manual) {
+                    const hash = hashLine(change.content);
+                    if (manual.content_hash === hash) {
+                        // 行号和内容都匹配，应用手动标记
+                        return {
+                            ...change,
+                            isAI: manual.attribution === 'ai',
+                            isManual: true,
+                            autoAttribution: change.isAI ? 'ai' : 'human'
+                        };
+                    }
+                    // 行号匹配但内容不匹配，标记为失效
+                    return {
+                        ...change,
+                        manualInvalid: true
+                    };
+                }
+                return change;
+            });
+
+            // 8. 重新计算统计（考虑手动标记）
+            const finalStats = {
+                added: stats.added,
+                deleted: stats.deleted,
+                ai_added: updatedChanges.filter(c => c.type === 'add' && c.isAI).length,
+                ai_deleted: updatedChanges.filter(c => c.type === 'del' && c.isAI).length
+            };
 
             res.json({
                 file_path: targetFile.to || targetFile.from || file_path,
                 from_commit,
                 to_commit: head,
-                changes,
-                stats
+                changes: updatedChanges,
+                stats: finalStats,
+                hasManualAttributions: manualAttrs.length > 0
             });
         });
     } catch (error) {
@@ -1052,15 +1191,69 @@ app.get('/api/github/analyze-file', async (req, res) => {
             }
 
             // 3. 构建 AI 代码知识库
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(rows, zlib, parseDiff);
 
             // 4. 分析文件归属
-            const { analysis, stats } = analyzeFileAttribution(lines, allAiLines);
+            const result = analyzeFileAttribution(lines, allAiLines);
+            
+            // 5. 获取并合并手动标记
+            db.all(`
+                SELECT line_number, attribution, content_hash
+                FROM manual_attributions 
+                WHERE repo_url = ? AND file_path = ? AND branch = ?
+            `, [repo_url, file_path, branch], (manualErr, manualRows) => {
+                if (manualErr) {
+                    console.warn('[github/analyze-file] Failed to load manual attributions:', manualErr);
+                    // 继续返回结果，只是没有手动标记
+                }
+                
+                // 构建手动标记映射
+                const manualMap = new Map();
+                if (manualRows && manualRows.length > 0) {
+                    manualRows.forEach(m => {
+                        manualMap.set(m.line_number, {
+                            attribution: m.attribution,
+                            content_hash: m.content_hash
+                        });
+                    });
+                }
+                
+                // 合并手动标记到分析结果
+                result.analysis = result.analysis.map(line => {
+                    const manual = manualMap.get(line.lineNumber);
+                    
+                    if (manual) {
+                        // 验证内容是否匹配（防止文件变更后标记失效）
+                        const currentHash = hashLine(line.content);
+                        const isValid = currentHash === manual.content_hash;
+                        
+                        return {
+                            ...line,
+                            attribution: isValid ? manual.attribution : line.attribution,
+                            isManual: isValid,
+                            autoAttribution: line.attribution,
+                            manualInvalid: !isValid  // 标记手动标记是否失效
+                        };
+                    }
+                    
+                    return line;
+                });
+                
+                // 重新计算统计（考虑手动标记）
+                const aiCount = result.analysis.filter(l => l.attribution === 'ai').length;
+                const humanCount = result.analysis.filter(l => l.attribution === 'human').length;
+                result.stats.ai_lines = aiCount;
+                result.stats.human_lines = humanCount;
 
-            res.json({
-                file_path,
-                stats,
-                analysis
+                res.json({
+                    file_path,
+                    stats: result.stats,
+                    analysis: result.analysis,
+                    duplicateStats: result.duplicateStats,
+                    warning: result.warning,
+                    hasManualAttributions: manualMap.size > 0,
+                    manualAttributionCount: manualMap.size
+                });
             });
         });
     } catch (error) {
@@ -1103,7 +1296,7 @@ app.get('/api/github/analyze-pr', async (req, res) => {
             }
 
             // 4. 构建 AI 代码知识库
-            const allAiLines = buildAiLinesSet(rows, zlib, parseDiff);
+            const allAiLines = buildAiLinesMap(rows, zlib, parseDiff);
 
             // 5. 分析每个文件的变更
             const fileStats = [];
@@ -1143,6 +1336,157 @@ app.get('/api/github/analyze-pr', async (req, res) => {
         console.error('[github/analyze-pr] Error:', error.message);
         res.status(500).json({ error: `Failed to analyze PR: ${error.message}` });
     }
+});
+
+// ========================================
+// 手动标记 API
+// ========================================
+
+// POST /api/manual-attribution - 保存手动标记
+app.post('/api/manual-attribution', (req, res) => {
+    const { 
+        repo_url, 
+        file_path, 
+        branch,
+        commit_hash,
+        manual_attributions,
+        user_id = 'default'
+    } = req.body;
+
+    if (!repo_url || !file_path || !branch || !manual_attributions || !Array.isArray(manual_attributions)) {
+        return res.status(400).json({ 
+            error: 'Missing required fields: repo_url, file_path, branch, manual_attributions (array)' 
+        });
+    }
+
+    // 使用事务批量插入/更新
+    db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+        
+        const stmt = db.prepare(`
+            INSERT INTO manual_attributions 
+            (repo_url, file_path, branch, commit_hash, line_number, content_hash, attribution, user_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(repo_url, file_path, branch, line_number) 
+            DO UPDATE SET 
+                content_hash = excluded.content_hash,
+                attribution = excluded.attribution,
+                user_id = excluded.user_id,
+                updated_at = datetime('now')
+        `);
+
+        let errorOccurred = false;
+        
+        manual_attributions.forEach(m => {
+            if (!m.lineNumber || !m.content || !m.attribution) {
+                errorOccurred = true;
+                return;
+            }
+            
+            stmt.run(
+                repo_url,
+                file_path,
+                branch,
+                commit_hash || null,
+                m.lineNumber,
+                hashLine(m.content),
+                m.attribution,
+                user_id
+            );
+        });
+
+        stmt.finalize((err) => {
+            if (err || errorOccurred) {
+                db.run('ROLLBACK');
+                return res.status(500).json({ error: 'Failed to save manual attributions' });
+            }
+            
+            db.run('COMMIT', (err) => {
+                if (err) {
+                    return res.status(500).json({ error: 'Failed to commit transaction' });
+                }
+                
+                res.json({ 
+                    success: true, 
+                    count: manual_attributions.length,
+                    message: `Saved ${manual_attributions.length} manual attribution(s)` 
+                });
+            });
+        });
+    });
+});
+
+// GET /api/manual-attribution - 获取手动标记
+app.get('/api/manual-attribution', (req, res) => {
+    const { repo_url, file_path, branch } = req.query;
+
+    if (!repo_url || !file_path || !branch) {
+        return res.status(400).json({ 
+            error: 'Missing required parameters: repo_url, file_path, branch' 
+        });
+    }
+
+    db.all(`
+        SELECT 
+            line_number,
+            content_hash,
+            attribution,
+            user_id,
+            created_at,
+            updated_at
+        FROM manual_attributions 
+        WHERE repo_url = ? AND file_path = ? AND branch = ?
+        ORDER BY line_number ASC
+    `, [repo_url, file_path, branch], (err, rows) => {
+        if (err) {
+            console.error('[manual-attribution] Error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        res.json({ 
+            manual_attributions: rows || [],
+            count: rows ? rows.length : 0
+        });
+    });
+});
+
+// DELETE /api/manual-attribution - 删除特定行的手动标记
+app.delete('/api/manual-attribution', (req, res) => {
+    const { repo_url, file_path, branch, line_number } = req.query;
+
+    if (!repo_url || !file_path || !branch) {
+        return res.status(400).json({ 
+            error: 'Missing required parameters: repo_url, file_path, branch' 
+        });
+    }
+
+    let sql;
+    let params;
+    
+    if (line_number) {
+        // 删除特定行
+        sql = `DELETE FROM manual_attributions 
+               WHERE repo_url = ? AND file_path = ? AND branch = ? AND line_number = ?`;
+        params = [repo_url, file_path, branch, parseInt(line_number)];
+    } else {
+        // 删除整个文件的所有标记
+        sql = `DELETE FROM manual_attributions 
+               WHERE repo_url = ? AND file_path = ? AND branch = ?`;
+        params = [repo_url, file_path, branch];
+    }
+
+    db.run(sql, params, function(err) {
+        if (err) {
+            console.error('[manual-attribution] Delete error:', err);
+            return res.status(500).json({ error: 'Failed to delete manual attributions' });
+        }
+
+        res.json({ 
+            success: true, 
+            deleted: this.changes,
+            message: `Deleted ${this.changes} manual attribution(s)` 
+        });
+    });
 });
 
 const server = app.listen(port, () => {
