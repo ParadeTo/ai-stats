@@ -74,8 +74,8 @@ pnpm start
 点击左侧的文件，系统会展示文件内容，每一行代码都标注了归属：
 - 绿色背景：AI 生成
 - 白色背景：人工编写
-- 橙色左边框 + ● 标记：有未保存的手动标记
-- 紫色左边框 + ✓ 标记：已保存的手动标记
+- ● 标记：有未保存的手动标记
+- ✓ 标记：已保存的手动标记
 - ⚠ 标记：手动标记已失效（内容已变更）
 
 ![代码归属展示截图占位](./mark.jpg)
@@ -352,10 +352,6 @@ hashLine('return true;')            // → "a3f5e9d2b1c8f4e1" (相同)
 hashLine('    return false;')       // → "b7c2d4e8f1a9b3c5" (不同)
 ```
 
-这个指纹具有两个重要特性：
-- **唯一性**：不同内容的代码行产生不同的哈希值
-- **稳定性**：相同内容的代码行总是产生相同的哈希值（即使空格不同）
-
 #### AI 代码索引数据结构
 
 系统使用 Map（映射）数据结构来存储 AI 生成的代码信息。可以把它理解为一个"字典"，通过代码的"指纹"（哈希值）来查找这行代码的详细信息。
@@ -502,11 +498,11 @@ if (codeTime >= aiTimestamp) {
 timestamp 就像一个"时间戳"，告诉系统：
 - "AI 是从1月15日开始知道这行代码的"
 - "如果某行代码在1月15日之前就存在，那肯定不是 AI 写的"
-- "如果某行代码在1月15日之后出现，那可能是 AI 写的"
+- "如果某行代码在1月15日之后出现，那可能是 AI 写的"（也有可能 AI 写了，人工删除又添加回来了）
 
 没有 timestamp，系统只能简单地认为"凡是内容相同的代码都是 AI"，这会错误地把你的劳动成果归给 AI。有了 timestamp，系统能区分"谁先写的"，避免误判。
 
-**为什么要记录 count（总次数）？**
+**为什么要记录 count？**
 
 用于检测重复代码问题。例如：
 
@@ -529,24 +525,6 @@ if (fileCount > aiInfo.count) {
 // 估算：3 行 AI，2 行人工
 ```
 
-**为什么要记录 occurrences（所有记录）？**
-
-用于追溯完整的生成历史。例如：
-
-```javascript
-const aiInfo = aiLinesMap.get(hash('return true;'));
-
-console.log('这行代码的完整生成历史：');
-aiInfo.occurrences.forEach((occurrence, index) => {
-    console.log(`第 ${index + 1} 次：${occurrence.timestamp} (${occurrence.generation_id})`);
-});
-
-// 输出：
-// 这行代码的完整生成历史：
-// 第 1 次：2024-01-15T10:00:00Z (gen-123)
-// 第 2 次：2024-01-20T14:30:00Z (gen-456)
-// 第 3 次：2024-01-25T09:15:00Z (gen-789)
-```
 
 #### 从数据库构建 AI 代码索引
 
@@ -813,7 +791,7 @@ if (aiInfo && aiInfo.timestamp <= fileTimestamp) {
 - [误判结果] 1月17日的 `return true;` 也会被标记为 AI（因为时间戳满足条件）
 - [无法识别] 中间的"删除→重新添加"过程
 
-**改进方向**（未实现）：
+**改进方向**：
 - 需要结合 Git 历史分析（`git log --follow`）追踪代码的删除和重新添加
 
 
@@ -971,10 +949,41 @@ result.analysis.forEach(line => {
 
 **场景概述**：分析两个 commit 之间的代码变更，计算 AI 代码占比。
 
-Commit 范围分析的核心是判断：在指定的 commit 范围内，哪些新增/删除是 AI 做的。这涉及两个关键数据结构：
+Commit 范围分析的核心是判断：在指定的 commit 范围内，哪些新增/删除是 AI 做的。这涉及三个关键数据结构：
 
-1. **`aiLinesInRange`**：范围内 AI 添加的代码
+1. **`allAiLines`**：历史上所有 AI 添加的代码（从数据库查询得到）
 2. **`allAiDeletes`**：历史上所有 AI 删除的代码（从数据库查询得到）
+3. **`aiLinesInRange`**：当前 commit 范围内 AI 添加的代码
+
+**`aiLinesInRange` 的构建过程**：
+
+通过两遍扫描 Git diff 来构建。第一遍扫描所有新增行，检查其哈希是否在 `allAiLines` 中，如果在就加入 `aiLinesInRange`：
+
+```javascript
+// 第一遍：识别当前 range 内 AI 添加的行
+const aiLinesInRange = new Set();
+
+diffFile.chunks.forEach(chunk => {
+    chunk.changes.forEach(change => {
+        if (change.type === 'add') {
+            const content = change.content.substring(1);
+            const hash = hashLine(content);
+            if (allAiLines.has(hash)) {
+                aiLinesInRange.add(hash);
+            }
+        }
+    });
+});
+```
+
+**新增操作的判断逻辑**：
+```javascript
+if (allAiLines.has(hash)) {
+    // 哈希在 AI 历史记录中 → AI 新增
+} else {
+    // 否则 → 人工新增
+}
+```
 
 **删除操作的判断逻辑**：
 ```javascript
@@ -1160,7 +1169,7 @@ function multiply(a, b) {    // ← AI 添加的新函数
 const aiLinesInRange = new Set();
 
 遍历 Git diff (A → B) 的所有新增行：
-  第 1 行：// 优化后的实现
+  第 1 行：
     → 查询数据库：在 AI 代码索引中 ✓
     → 加入 aiLinesInRange
     
@@ -1186,7 +1195,6 @@ const aiLinesInRange = new Set();
 ```javascript
 const hash = hashLine('return a + b;');
 
-// 判断逻辑
 检查 1：AI 历史上删除过这行吗？
   → allAiDeletes.has(hash)
   → false（这是第一次删除这行）
@@ -1213,12 +1221,7 @@ const hash = hashLine('return a + b;');
 }
 ```
 
-这个案例展示了 `aiLinesInRange` 的作用：
-
-1. **范围内 AI 添加**：AI 在 A → B 期间添加了 `return a + b;`
-2. **也删除了相同内容**：旧的 `return a + b;` 被删除
-3. **判断逻辑**：因为 AI 在这个范围内添加过这行代码，所以删除操作也归属于 AI
-4. **实际场景**：AI 重构代码时，经常会删除旧代码，添加新代码（即使内容相同）
+`aiLinesInRange` 的作用是识别 AI 在当前 commit 范围内"删除旧代码 + 添加相同内容新代码"的重构行为，将这类删除操作正确归属给 AI。如果没有这个数据结构，由于 `allAiDeletes` 中没有这行代码的删除记录，系统会将其误判为人工删除，导致统计结果出现偏差。
 
 ## 总结
 
