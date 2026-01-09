@@ -24,21 +24,21 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 /**
- * 初始化 Cursor 钩子，注入 beforeSubmitPrompt 和 stop 钩子到 ~/.cursor/hooks.json
+ * 初始化 Cursor 钩子，注入 afterFileEdit 和 stop 钩子到 ~/.cursor/hooks.json
  */
 function initializeHooks(context: vscode.ExtensionContext) {
   const homeDir = os.homedir()
   const cursorDir = path.join(homeDir, '.cursor')
   const hooksPath = path.join(cursorDir, 'hooks.json')
 
-  const beforeSubmitPromptPath = path.join(
+  const afterFileEditPath = path.join(
     context.extensionPath,
     'scripts',
-    'beforeSubmitPrompt.js'
+    'afterFileEdit.js'
   )
   const stopScriptPath = path.join(context.extensionPath, 'scripts', 'stop.js')
 
-  const beforeSubmitPromptCmd = `node "${beforeSubmitPromptPath}"`
+  const afterFileEditCmd = `node "${afterFileEditPath}"`
   const stopCmd = `node "${stopScriptPath}"`
 
   try {
@@ -66,23 +66,23 @@ function initializeHooks(context: vscode.ExtensionContext) {
     // 确保 hooks 字段存在
     if (!config.hooks) {
       config.hooks = {}
-      }
+    }
 
     let needsUpdate = false
 
-    // 注入 beforeSubmitPrompt 钩子
-    if (!Array.isArray(config.hooks.beforeSubmitPrompt)) {
-      config.hooks.beforeSubmitPrompt = config.hooks.beforeSubmitPrompt
-        ? [{command: config.hooks.beforeSubmitPrompt}]
+    // 注入 afterFileEdit 钩子（记录 AI 编辑的精确内容）
+    if (!Array.isArray(config.hooks.afterFileEdit)) {
+      config.hooks.afterFileEdit = config.hooks.afterFileEdit
+        ? [{command: config.hooks.afterFileEdit}]
         : []
     }
 
-    const hasBeforeSubmitPrompt = config.hooks.beforeSubmitPrompt.some(
-      (h: any) => h.command?.includes(beforeSubmitPromptCmd)
+    const hasAfterFileEdit = config.hooks.afterFileEdit.some((h: any) =>
+      h.command?.includes(afterFileEditCmd)
     )
 
-    if (!hasBeforeSubmitPrompt) {
-      config.hooks.beforeSubmitPrompt.push({command: beforeSubmitPromptCmd})
+    if (!hasAfterFileEdit) {
+      config.hooks.afterFileEdit.push({command: afterFileEditCmd})
       needsUpdate = true
     }
 

@@ -11,13 +11,14 @@ const path = require('path');
 const os = require('os');
 const zlib = require('zlib');
 const { execSync } = require('child_process');
+const { loadSessionData, clearSessionData } = require('./utils/session');
 
 // 配置
 const CONFIG = {
     REPORT_URL: 'http://127.0.0.1:3001/api/create-task',  // 使用 127.0.0.1 而不是 localhost
     TIMEOUT: 5000,
     CONFIG_PATH: path.join(os.homedir(), '.ai-code-stats', 'config.json'),
-    LOG_PATH: path.join(os.homedir(), '.ai-code-stats', 'debug.log')
+    LOG_PATH: path.join(os.homedir(), '.ai-code-stats', 'logs', 'debug.log')
 };
 
 function log(message) {
@@ -60,19 +61,43 @@ async function main() {
         const token = getAuthToken();
         const userId = token ? 'user_from_token' : 'anonymous';
 
-        // 2. 获取完整的 Git Diff (使用正确的工作区目录)
-        const compressedDiff = getCompressedGitDiff(workspaceRoot);
+        // 2. 加载 session 数据，获取 AI 编辑的精确内容
+        const generationId = metadata.generation_id;
+        let fileEdits = [];
+        if (generationId) {
+            const sessionData = loadSessionData(generationId);
+            if (sessionData && sessionData.fileEdits) {
+                fileEdits = sessionData.fileEdits;
+                log(`Loaded ${fileEdits.length} file edits from session`);
+            }
+        }
+
+        // 3. 构建 AI 编辑的 diff（使用 Cursor 传入的精确编辑内容）
+        let compressedDiff;
+        if (fileEdits.length > 0) {
+            // 使用精确的编辑内容构建 diff，传入 workspaceRoot 用于转换为相对路径
+            compressedDiff = buildCompressedDiffFromEdits(fileEdits, workspaceRoot);
+            log(`Built diff from ${fileEdits.length} file edits`);
+        } else {
+            // Fallback: 如果没有 edits 数据，使用 git diff（兼容旧版本 Cursor）
+            log('No file edits in session, falling back to git diff');
+            compressedDiff = getCompressedGitDiff(workspaceRoot);
+        }
+        
         if (!compressedDiff) {
             log('No diff changes found, skipping report');
+            if (generationId) {
+                clearSessionData(generationId);
+            }
             return;
         }
 
-        // 3. 获取 Git 上下文
+        // 4. 获取 Git 上下文
         const gitContext = getGitContext(workspaceRoot);
 
-        // 4. 构建上报负载
+        // 5. 构建上报负载
         const payload = {
-            generation_id: metadata.generation_id || `gen-${Date.now()}`,
+            generation_id: generationId || `gen-${Date.now()}`,
             user_id: userId,
             repo_url: gitContext.repoUrl, // 规范化后的远程仓库 URL
             branch_name: gitContext.branch,
@@ -104,8 +129,13 @@ async function main() {
             log(`Failed to save payload: ${e.message}`);
         }
 
-        // 5. 异步上报
+        // 6. 异步上报
         reportData(payload, token);
+
+        // 7. 清理 session 数据
+        if (generationId) {
+            clearSessionData(generationId);
+        }
 
     } catch (error) {
         log(`Error: ${error.message}\n${error.stack}`);
@@ -113,27 +143,108 @@ async function main() {
 }
 
 /**
- * 获取压缩后的 Git Diff
+ * 从 AI 编辑内容构建压缩的 diff
+ * @param {Array} fileEdits - AI 编辑记录数组 [{filePath, edits: [{old_string, new_string}]}]
+ * @param {string} workspaceRoot - 工作区根目录，用于将绝对路径转换为相对路径
+ * @returns {string|null} - Base64 编码的压缩 diff
  */
-function getCompressedGitDiff(cwd) {
+function buildCompressedDiffFromEdits(fileEdits, workspaceRoot = '') {
     try {
-        log(`getCompressedGitDiff in ${cwd}`);
+        if (!fileEdits || fileEdits.length === 0) {
+            return null;
+        }
+
+        // 构建类似 unified diff 格式的文本
+        let diffText = '';
+        
+        fileEdits.forEach(({ filePath, edits }) => {
+            if (!edits || edits.length === 0) return;
+            
+            // 将绝对路径转换为相对路径
+            let relativePath = filePath;
+            if (workspaceRoot && filePath.startsWith(workspaceRoot)) {
+                relativePath = filePath.slice(workspaceRoot.length);
+                // 移除开头的斜杠
+                if (relativePath.startsWith('/')) {
+                    relativePath = relativePath.slice(1);
+                }
+            }
+            
+            diffText += `diff --git a/${relativePath} b/${relativePath}\n`;
+            diffText += `--- a/${relativePath}\n`;
+            diffText += `+++ b/${relativePath}\n`;
+            
+            edits.forEach(({ old_string, new_string }) => {
+                const oldLines = (old_string || '').split('\n');
+                const newLines = (new_string || '').split('\n');
+                
+                // 简化的 hunk header
+                diffText += `@@ -1,${oldLines.length} +1,${newLines.length} @@\n`;
+                
+                // 删除的行
+                oldLines.forEach(line => {
+                    if (line !== undefined) {
+                        diffText += `-${line}\n`;
+                    }
+                });
+                
+                // 新增的行
+                newLines.forEach(line => {
+                    if (line !== undefined) {
+                        diffText += `+${line}\n`;
+                    }
+                });
+            });
+        });
+
+        if (!diffText.trim()) {
+            return null;
+        }
+
+        // Gzip 压缩并转 Base64
+        const compressed = zlib.gzipSync(Buffer.from(diffText, 'utf8'));
+        const base64 = compressed.toString('base64');
+        log(`Diff from edits compressed: ${diffText.length} bytes -> ${base64.length} chars`);
+        return base64;
+
+    } catch (e) {
+        log(`buildCompressedDiffFromEdits error: ${e.message}`);
+        return null;
+    }
+}
+
+/**
+ * 获取压缩后的 Git Diff（Fallback 方案）
+ * @param {string} cwd - 工作目录
+ * @param {string[]} filePaths - AI 编辑的文件路径列表（如果为空则获取整个工作区的 diff）
+ */
+function getCompressedGitDiff(cwd, filePaths = []) {
+    try {
+        const hasSpecificFiles = filePaths && filePaths.length > 0;
+        log(`getCompressedGitDiff in ${cwd}, specific files: ${hasSpecificFiles ? filePaths.join(', ') : 'none (full diff)'}`);
         
         // 1. 获取未跟踪文件并临时标记为 -N (intent-to-add)
         const statusOutput = execSync('git status --porcelain', { 
             cwd, 
             encoding: 'utf8',
-            maxBuffer: 100 * 1024 * 1024 // 100MB
+            maxBuffer: 100 * 1024 * 1024
         });
-        const untrackedFiles = statusOutput
+        
+        let untrackedFiles = statusOutput
             .split('\n')
             .filter(line => line.startsWith('??'))
             .map(line => line.substring(3).trim())
             .filter(file => {
-                // 过滤掉不应该跟踪的大文件/目录
                 const ignorePatterns = ['node_modules/', 'dist/', 'build/', '.next/', 'out/', '.git/'];
                 return !ignorePatterns.some(pattern => file.includes(pattern));
             });
+
+        // 如果指定了文件列表，只处理这些文件中的未跟踪文件
+        if (hasSpecificFiles) {
+            untrackedFiles = untrackedFiles.filter(file => 
+                filePaths.some(fp => fp.endsWith(file) || file.endsWith(fp) || fp === file)
+            );
+        }
 
         if (untrackedFiles.length > 0) {
             log(`Adding ${untrackedFiles.length} untracked files`);
@@ -146,11 +257,22 @@ function getCompressedGitDiff(cwd) {
             });
         }
 
-        // 2. 获取完整 diff (HEAD vs 工作区)，排除 node_modules 等大目录
-        const diff = execSync('git diff -- . ":(exclude)node_modules" ":(exclude)dist" ":(exclude)build" ":(exclude).next" ":(exclude)out"', { 
+        // 2. 获取 diff
+        let diffCommand;
+        if (hasSpecificFiles) {
+            // 只获取 AI 编辑的文件的 diff
+            const fileArgs = filePaths.map(f => `"${f}"`).join(' ');
+            diffCommand = `git diff -- ${fileArgs}`;
+            log(`Getting diff for specific files: ${diffCommand}`);
+        } else {
+            // 获取整个工作区的 diff（fallback）
+            diffCommand = 'git diff -- . ":(exclude)node_modules" ":(exclude)dist" ":(exclude)build" ":(exclude).next" ":(exclude)out"';
+        }
+        
+        const diff = execSync(diffCommand, { 
             cwd, 
             encoding: 'utf8',
-            maxBuffer: 100 * 1024 * 1024 // 增加到 100MB
+            maxBuffer: 100 * 1024 * 1024
         });
 
         // 3. 恢复未跟踪文件的状态

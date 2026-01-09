@@ -612,73 +612,64 @@ app.get('/api/commit-range-stats', (req, res) => {
     }
 });
 
-// GET /api/project-files - Get file list for a project
-app.get('/api/project-files', (req, res) => {
-    const { repo_url, branch } = req.query;
+// GET /api/project-files - Get file list for a project (based on Git diff)
+app.get('/api/project-files', async (req, res) => {
+    const { repo_url, branch, base = 'main', github_token } = req.query;
 
     if (!repo_url) {
         return res.status(400).json({ error: 'Missing repo_url' });
     }
 
-    let query = 'SELECT compressed_diff FROM task_records WHERE repo_url = ?';
-    const params = [repo_url];
-
-    if (branch) {
-        query += ' AND branch_name = ?';
-        params.push(branch);
+    if (!branch) {
+        return res.status(400).json({ error: 'Missing branch' });
     }
 
-    db.all(query, params, (err, rows) => {
-        if (err) {
-            return res.status(500).json({ error: 'Database error' });
+    try {
+        // 1. 从 GitHub 获取分支与 base 的 diff
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        const diff = await github.getCompareDiff(repo_url, base, branch);
+        
+        // 2. 解析 diff 获取所有改动文件
+        const diffFiles = parseDiff(diff);
+        if (diffFiles.length === 0) {
+            return res.json([]);
         }
 
-        const filesMap = new Map();
-
-        rows.forEach(row => {
-            try {
-                const buffer = Buffer.from(row.compressed_diff, 'base64');
-                const decompressed = zlib.gunzipSync(buffer).toString('utf8');
-                const files = parseDiff(decompressed);
-
-                files.forEach(file => {
-                    const filePath = file.to || file.from;
-                    if (!filePath) return;
-
-                    if (!filesMap.has(filePath)) {
-                        filesMap.set(filePath, {
-                            file_path: filePath.replace(/^[ab]\//, ''),
-                            ai_lines: 0,
-                            manual_lines: 0,
-                            unchanged_lines: 0,
-                            total_lines: 0
-                        });
-                    }
-
-                    const fileStats = filesMap.get(filePath);
-                    file.chunks.forEach(chunk => {
-                        chunk.changes.forEach(change => {
-                            if (change.type === 'add') {
-                                fileStats.ai_lines++;
-                                fileStats.total_lines++;
-                            } else if (change.type === 'del') {
-                                fileStats.manual_lines++;
-                            }
-                        });
-                    });
-                });
-            } catch (e) {
-                console.error('Error processing diff:', e.message);
+        // 3. 从数据库获取 AI 追踪数据，构建 AI 代码知识库
+        const repoName = path.basename(repo_url.replace('.git', ''));
+        
+        db.all('SELECT * FROM task_records WHERE repo_url LIKE ?', [`%${repoName}%`], (err, rows) => {
+            if (err) {
+                return res.status(500).json({ error: 'Database error' });
             }
+
+            // 构建 AI 代码知识库
+            const allAiLines = buildAiLinesMap(rows || [], zlib, parseDiff);
+            const allAiDeletes = buildAiDeletesMap(rows || [], zlib, parseDiff);
+
+            // 4. 分析每个文件的 AI 占比
+            const filesList = diffFiles.map(file => {
+                const filePath = file.to || file.from;
+                if (!filePath) return null;
+
+                const { stats } = analyzeCommitRangeDiff(file, allAiLines, allAiDeletes);
+                
+                return {
+                    file_path: filePath,
+                    ai_lines: stats.ai_added,
+                    added_lines: stats.added,
+                    deleted_lines: stats.deleted,
+                    ai_ratio: stats.added > 0 ? (stats.ai_added / stats.added * 100) : 0
+                };
+            }).filter(Boolean);
+
+            res.json(filesList);
         });
-
-        const filesList = Array.from(filesMap.values()).map(file => ({
-            ...file,
-            ai_ratio: file.total_lines > 0 ? (file.ai_lines / file.total_lines * 100) : 0
-        }));
-
-        res.json(filesList);
-    });
+    } catch (error) {
+        console.error('[project-files] Error:', error.message);
+        res.status(500).json({ error: `Failed to get project files: ${error.message}` });
+    }
 });
 
 // GET /api/analyze-file - Deep attribution analysis for a specific file
@@ -1193,8 +1184,8 @@ app.get('/api/github/analyze-file', async (req, res) => {
             // 3. 构建 AI 代码知识库
             const allAiLines = buildAiLinesMap(rows, zlib, parseDiff);
 
-            // 4. 分析文件归属
-            const result = analyzeFileAttribution(lines, allAiLines);
+            // 4. 分析文件归属（传入文件路径用于过滤，只有 AI 在该文件中生成过的代码才算 AI）
+            const result = analyzeFileAttribution(lines, allAiLines, { filePath: file_path });
             
             // 5. 获取并合并手动标记
             db.all(`

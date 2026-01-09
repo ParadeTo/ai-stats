@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const path = require('path');
 
 /**
  * 计算行内容的哈希值（用于 AI 代码匹配）
@@ -12,11 +13,26 @@ function hashLine(line) {
 }
 
 /**
+ * 规范化文件路径，提取相对路径部分
+ * 处理绝对路径和相对路径的统一匹配
+ */
+function normalizeFilePath(filePath) {
+    if (!filePath) return '';
+    // 移除开头的 a/ 或 b/（git diff 格式）
+    let normalized = filePath.replace(/^[ab]\//, '');
+    // 如果是绝对路径，提取文件名
+    if (path.isAbsolute(normalized)) {
+        normalized = path.basename(normalized);
+    }
+    return normalized;
+}
+
+/**
  * 从 AI 生成记录中提取所有 AI 生成的行的哈希映射
  * @param {Array} rows - 数据库中的 task_records
  * @param {Object} zlib - zlib 模块
  * @param {Function} parseDiff - parse-diff 函数
- * @returns {Map} - AI 生成行的哈希映射，key=hash, value={timestamp, generation_id, count, occurrences}
+ * @returns {Map} - AI 生成行的哈希映射，key=hash, value={timestamp, generation_id, count, occurrences, files}
  */
 function buildAiLinesMap(rows, zlib, parseDiff) {
     const aiLinesMap = new Map();
@@ -28,6 +44,10 @@ function buildAiLinesMap(rows, zlib, parseDiff) {
             const files = parseDiff(decompressed);
             
             files.forEach(file => {
+                const rawFilePath = file.to || file.from;
+                if (!rawFilePath) return;
+                const filePath = normalizeFilePath(rawFilePath);
+                
                 file.chunks.forEach(chunk => {
                     chunk.changes.forEach(change => {
                         if (change.type === 'add') {
@@ -42,8 +62,10 @@ function buildAiLinesMap(rows, zlib, parseDiff) {
                                     count: 1,
                                     occurrences: [{
                                         timestamp: row.created_at,
-                                        generation_id: row.generation_id
-                                    }]
+                                        generation_id: row.generation_id,
+                                        filePath
+                                    }],
+                                    files: new Set([filePath])
                                 });
                             } else {
                                 // 已存在，增加计数
@@ -51,8 +73,10 @@ function buildAiLinesMap(rows, zlib, parseDiff) {
                                 existing.count++;
                                 existing.occurrences.push({
                                     timestamp: row.created_at,
-                                    generation_id: row.generation_id
+                                    generation_id: row.generation_id,
+                                    filePath
                                 });
+                                existing.files.add(filePath);
                                 
                                 // 保持 timestamp 为最早的生成时间
                                 if (row.created_at < existing.timestamp) {
@@ -163,7 +187,7 @@ function buildAiDeletesSet(rows, zlib, parseDiff) {
  * 分析 commit range 内的代码归属
  * 区分：在当前 range 内 AI 添加的行 vs 在 range 外添加的行
  * @param {Object} diffFile - parse-diff 解析的文件对象
- * @param {Map} allAiLines - 所有历史 AI 生成行的详细信息 Map<hash, {timestamp, generation_id}>
+ * @param {Map} allAiLines - 所有历史 AI 生成行的详细信息 Map<hash, {timestamp, generation_id, files}>
  * @param {Map} allAiDeletes - 所有历史 AI 删除行的详细信息 Map<hash, {timestamp, generation_id}>（可选）
  * @returns {Object} - 包含变更列表和统计信息
  */
@@ -171,6 +195,10 @@ function analyzeCommitRangeDiff(diffFile, allAiLines, allAiDeletes = null) {
     const aiLinesInRange = new Set(); // 当前 range 内 AI 添加的行
     const changes = [];
     const stats = { added: 0, deleted: 0, ai_added: 0, ai_deleted: 0 };
+    
+    // 获取当前文件路径（规范化后的）
+    const rawFilePath = diffFile.to || diffFile.from;
+    const currentFilePath = normalizeFilePath(rawFilePath);
 
     // 第一遍：识别当前 range 内 AI 添加的行
     diffFile.chunks.forEach(chunk => {
@@ -178,7 +206,9 @@ function analyzeCommitRangeDiff(diffFile, allAiLines, allAiDeletes = null) {
             if (change.type === 'add') {
                 const content = change.content.substring(1);
                 const hash = hashLine(content);
-                if (allAiLines.has(hash)) {
+                const aiInfo = allAiLines.get(hash);
+                // 只有当 AI 在当前文件中生成过这行代码时，才算 AI 代码
+                if (aiInfo && aiInfo.files && aiInfo.files.has(currentFilePath)) {
                     aiLinesInRange.add(hash);
                 }
             }
@@ -193,7 +223,9 @@ function analyzeCommitRangeDiff(diffFile, allAiLines, allAiDeletes = null) {
 
             if (change.type === 'add') {
                 stats.added++;
-                const isAI = allAiLines.has(hash);
+                const aiInfo = allAiLines.get(hash);
+                // 只有当 AI 在当前文件中生成过这行代码时，才算 AI 代码
+                const isAI = aiInfo && aiInfo.files && aiInfo.files.has(currentFilePath);
                 if (isAI) stats.ai_added++;
                 
                 changes.push({
@@ -205,14 +237,11 @@ function analyzeCommitRangeDiff(diffFile, allAiLines, allAiDeletes = null) {
             } else if (change.type === 'del') {
                 stats.deleted++;
                 
-                // 新逻辑：如果提供了 allAiDeletes，优先使用它来判断
-                // 否则使用旧逻辑（只有在 range 内被 AI 添加的才算 AI 删除）
+                // 删除判断逻辑保持不变
                 let isAI;
                 if (allAiDeletes !== null) {
-                    // 只要 AI 执行过删除操作，就算 AI 删除
                     isAI = allAiDeletes.has(hash);
                 } else {
-                    // 旧逻辑：只有在当前 range 内被 AI 添加的行才算 AI 删除
                     isAI = aiLinesInRange.has(hash);
                 }
                 
@@ -239,15 +268,18 @@ function analyzeCommitRangeDiff(diffFile, allAiLines, allAiDeletes = null) {
 }
 
 /**
- * 分析完整文件的代码归属（基于内容哈希匹配，支持时间过滤）
+ * 分析完整文件的代码归属（基于内容哈希匹配，支持时间过滤和文件路径过滤）
  * @param {Array} lines - 文件的所有行
- * @param {Map} aiLines - AI 生成行的详细映射 Map<hash, {timestamp, generation_id}>
+ * @param {Map} aiLines - AI 生成行的详细映射 Map<hash, {timestamp, generation_id, files}>
  * @param {Object} options - 可选配置
- * @param {string} options.fileTimestamp - 文件/代码的时间戳，用于时间过滤（ISO格式字符串）。建议总是提供以获得更准确的结果。
+ * @param {string} options.fileTimestamp - 文件/代码的时间戳，用于时间过滤（ISO格式字符串）
+ * @param {string} options.filePath - 当前文件路径，用于文件路径过滤（只有 AI 在该文件中生成过的代码才算 AI）
  * @returns {Object} - 包含逐行分析和统计
  */
 function analyzeFileAttribution(lines, aiLines, options = {}) {
     const useTimeFilter = options.fileTimestamp && aiLines instanceof Map;
+    const useFileFilter = options.filePath && aiLines instanceof Map;
+    const normalizedFilePath = useFileFilter ? normalizeFilePath(options.filePath) : null;
     
     // 第一遍：统计每个 hash 在文件中出现的次数
     const hashCounts = new Map();
@@ -264,14 +296,21 @@ function analyzeFileAttribution(lines, aiLines, options = {}) {
 
         const aiInfo = aiLines.get(hash);
         if (aiInfo) {
-            if (useTimeFilter) {
-                // 时间过滤：只有在该行代码时间之前生成的 AI 才算
-                isAI = aiInfo.timestamp <= options.fileTimestamp;
-            } else {
-                // 不使用时间过滤，可能产生误判
-                isAI = true;
+            // 文件路径过滤：只有 AI 在当前文件中生成过这行代码才算 AI
+            let fileMatch = true;
+            if (useFileFilter && aiInfo.files) {
+                fileMatch = aiInfo.files.has(normalizedFilePath);
             }
-            generation_id = aiInfo.generation_id;
+            
+            if (fileMatch) {
+                if (useTimeFilter) {
+                    // 时间过滤：只有在该行代码时间之前生成的 AI 才算
+                    isAI = aiInfo.timestamp <= options.fileTimestamp;
+                } else {
+                    isAI = true;
+                }
+                generation_id = aiInfo.generation_id;
+            }
         }
 
         return {
@@ -333,6 +372,7 @@ function analyzeFileAttribution(lines, aiLines, options = {}) {
 
 module.exports = {
     hashLine,
+    normalizeFilePath,
     buildAiLinesMap,
     buildAiDeletesMap,
     analyzeCommitRangeDiff,
