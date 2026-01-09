@@ -304,64 +304,88 @@ app.get('/api/branch-diff-stats', (req, res) => {
     }
 });
 
-// GET /api/projects - Get project list with AI statistics (based on branch diff)
-app.get('/api/projects', (req, res) => {
+// GET /api/projects - Get project list with AI statistics (based on branch vs main diff)
+app.get('/api/projects', async (req, res) => {
+    const { base = 'main', github_token } = req.query;
+    
     const query = `
         SELECT 
             repo_url,
             branch_name,
             user_id,
-            MAX(created_at) as last_generation,
-            GROUP_CONCAT(compressed_diff) as all_diffs
+            MAX(created_at) as last_generation
         FROM task_records
         GROUP BY repo_url, branch_name, user_id
         ORDER BY last_generation DESC
     `;
 
-    db.all(query, [], (err, rows) => {
+    db.all(query, [], async (err, rows) => {
         if (err) {
             return res.status(500).json({ error: 'Database error' });
         }
 
-        const projects = rows.map(row => {
+        const token = github_token || process.env.GITHUB_TOKEN;
+        const github = new GitHubApi(token);
+        
+        // 获取 AI 知识库
+        const allRows = await new Promise((resolve, reject) => {
+            db.all('SELECT * FROM task_records', [], (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows || []);
+            });
+        });
+        const allAiLines = buildAiLinesMap(allRows, zlib, parseDiff);
+
+        const projects = await Promise.all(rows.map(async (row) => {
             let ai_lines = 0;
-            let total_lines = 0;
+            let total_added = 0;
+            let total_deleted = 0;
+            let error = null;
 
-            // Calculate stats from all diffs
-            const diffs = row.all_diffs ? row.all_diffs.split(',') : [];
-            diffs.forEach(compressedDiff => {
-                try {
-                    const buffer = Buffer.from(compressedDiff, 'base64');
-                    const decompressed = zlib.gunzipSync(buffer).toString('utf8');
-                    const files = parseDiff(decompressed);
+            try {
+                // 从 GitHub 获取分支与 base 的 diff
+                const diff = await github.getCompareDiff(row.repo_url, base, row.branch_name);
+                const files = parseDiff(diff);
 
-                    files.forEach(file => {
-                        file.chunks.forEach(chunk => {
-                            chunk.changes.forEach(change => {
-                                if (change.type === 'add') {
+                // 统计分支 diff 中的所有变更，并匹配 AI 知识库
+                files.forEach(file => {
+                    const filePath = file.to || file.from;
+                    const normalizedPath = filePath ? path.basename(filePath) : '';
+                    
+                    file.chunks.forEach(chunk => {
+                        chunk.changes.forEach(change => {
+                            if (change.type === 'add') {
+                                total_added++;
+                                // 检查是否为 AI 生成（需要文件路径匹配）
+                                const content = change.content.substring(1);
+                                const hash = hashLine(content);
+                                const aiInfo = allAiLines.get(hash);
+                                if (aiInfo && aiInfo.files && aiInfo.files.has(normalizedPath)) {
                                     ai_lines++;
-                                    total_lines++;
-                                } else if (change.type === 'del') {
-                                    total_lines++;
                                 }
-                            });
+                            } else if (change.type === 'del') {
+                                total_deleted++;
+                            }
                         });
                     });
-                } catch (e) {
-                    console.error('Error processing diff:', e.message);
-                }
-            });
+                });
+            } catch (e) {
+                console.error(`[projects] Error fetching diff for ${row.repo_url}:${row.branch_name}:`, e.message);
+                error = e.message;
+            }
 
             return {
                 repo_url: row.repo_url,
                 branch_name: row.branch_name,
                 user_id: row.user_id,
                 ai_lines,
-                total_lines,
-                ai_ratio: total_lines > 0 ? (ai_lines / total_lines * 100) : 0,
-                last_generation: row.last_generation
+                total_added,
+                total_deleted,
+                ai_ratio: total_added > 0 ? (ai_lines / total_added * 100) : 0,
+                last_generation: row.last_generation,
+                error
             };
-        });
+        }));
 
         res.json(projects);
     });
